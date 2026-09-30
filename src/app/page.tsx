@@ -175,7 +175,51 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // Background polling: runs every 4.5 seconds via dedicated Web Worker.
+  // ── Real-Time Live Push Stream (Server-Sent Events) ───────────────────────
+  // Instantly refreshes the dashboard the EXACT millisecond the NodeMCU calls
+  // POST /api/sitting/start or POST /api/sitting/stop.
+  useEffect(() => {
+    let es: EventSource | null = null;
+    let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
+
+    const connectSSE = () => {
+      if (typeof window === 'undefined') return;
+
+      try {
+        es = new EventSource('/api/sitting/stream');
+
+        es.onmessage = (event) => {
+          try {
+            const payload = JSON.parse(event.data);
+            if (payload.type === 'STATUS_CHANGE') {
+              console.log('[Real-Time Telemetry] Instant event received from NodeMCU:', payload.action);
+              // Trigger instant data refresh, audio chime, and notification (< 20ms)
+              fetchStatus(true);
+            }
+          } catch {
+            fetchStatus(true);
+          }
+        };
+
+        es.onerror = () => {
+          es?.close();
+          // Auto-reconnect after 3 seconds if disconnected
+          reconnectTimeout = setTimeout(connectSSE, 3000);
+        };
+      } catch (err) {
+        console.warn('SSE connection failed, falling back to Web Worker polling:', err);
+      }
+    };
+
+    connectSSE();
+
+    return () => {
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      es?.close();
+    };
+  }, [fetchStatus]);
+
+  // Background polling: runs every 4.5 seconds via dedicated Web Worker as a fallback heartbeat.
   // Dedicated Web Workers bypass Chrome's background tab timer throttling completely,
   // ensuring telemetry is checked whether the tab is focused, minimized, or in the background.
   useEffect(() => {

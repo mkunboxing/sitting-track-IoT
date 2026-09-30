@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseServerClient, isSupabaseConfigured } from '@/lib/supabaseServer';
 import { verifyDeviceToken } from '@/lib/auth';
+import { eventBroadcaster } from '@/lib/eventBroadcaster';
 
 export async function POST(req: NextRequest) {
   // 1. Verify device authorization header
@@ -82,6 +83,9 @@ export async function POST(req: NextRequest) {
     console.log(
       `[API /sitting/stop] Stopped session ${updatedSession.id}. Duration: ${durationSeconds} seconds.`
     );
+
+    // Broadcast change immediately to all open dashboard tabs (< 20ms)
+    eventBroadcaster.broadcast('stop', { session: updatedSession, durationSeconds });
 
     return NextResponse.json(
       {

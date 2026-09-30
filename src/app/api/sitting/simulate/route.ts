@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseServerClient, isSupabaseConfigured } from '@/lib/supabaseServer';
+import { eventBroadcaster } from '@/lib/eventBroadcaster';
 
 /**
  * Development / Testing helper endpoint:
@@ -58,6 +59,8 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ success: false, error: error.message }, { status: 500 });
       }
 
+      eventBroadcaster.broadcast('start', { session: newSession });
+
       return NextResponse.json({
         success: true,
         status: 'started',
@@ -100,6 +103,8 @@ export async function POST(req: NextRequest) {
       if (error) {
         return NextResponse.json({ success: false, error: error.message }, { status: 500 });
       }
+
+      eventBroadcaster.broadcast('stop', { session: updatedSession, durationSeconds });
 
       return NextResponse.json({
         success: true,
