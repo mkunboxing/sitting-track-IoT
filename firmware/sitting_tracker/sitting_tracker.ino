@@ -41,8 +41,8 @@
 // ==============================================================================
 
 // Replace with your Wi-Fi network credentials
-const char* WIFI_SSID     = "YOUR_WIFI_SSID";
-const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
+const char* WIFI_SSID     = "Mywifi";
+const char* WIFI_PASSWORD = "12343211";
 
 // Server Base URL (Do NOT include trailing slash)
 // For local testing:  "http://192.168.1.100:3000"
@@ -50,7 +50,7 @@ const char* WIFI_PASSWORD = "YOUR_WIFI_PASSWORD";
 const char* SERVER_BASE_URL = "https://your-sitting-tracker.vercel.app";
 
 // Secret Device Authentication Token (must match DEVICE_TOKEN in your .env.local / Vercel)
-const char* DEVICE_TOKEN    = "tracker-secret-device-key-change-me";
+const char* DEVICE_TOKEN    = "515e0200-a088-4c67-b6fc-3dc9cfb941d3";
 
 // ==============================================================================
 // 2. HARDWARE PIN DEFINITIONS & THRESHOLDS
