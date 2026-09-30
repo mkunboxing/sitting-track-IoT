@@ -9,6 +9,7 @@ import { SessionHistory } from '@/components/SessionHistory';
 import { HardwareGuideModal } from '@/components/HardwareGuideModal';
 import { DashboardStatsResponse } from '@/types/sitting';
 import { soundManager } from '@/lib/soundUtils';
+import { notificationManager } from '@/lib/notificationManager';
 import { Bell, Flame, ShieldAlert, Sparkles, X, HeartPulse } from 'lucide-react';
 
 export default function DashboardPage() {
@@ -51,15 +52,18 @@ export default function DashboardPage() {
       setData(json);
       setErrorMessage(null);
 
-      // Sound alert on state transition
+      // Sound alert on state transition (page-side, when tab is visible)
+      // The SW handles background sound relay via postMessage when the tab is hidden.
       if (previousStatusRef.current !== null && previousStatusRef.current !== json.status) {
         if (json.status === 'SITTING') {
-          soundManager.playSitDown();
+          // Only play from page if SW hasn't already triggered it (tab was visible)
+          if (!document.hidden) soundManager.playSitDown();
         } else if (json.status === 'AWAY') {
-          soundManager.playStandUp();
+          if (!document.hidden) soundManager.playStandUp();
           // Reset break alarm when user stands up
           setBreakAlertDismissed(false);
           breakAlarmPlayedRef.current = false;
+          notificationManager.resetBreakAlarm();
         }
       }
       previousStatusRef.current = json.status;
@@ -88,6 +92,8 @@ export default function DashboardPage() {
           setData(json);
           previousStatusRef.current = json.status;
           setIsLoading(false);
+          // Tell SW the current status so it doesn't fire a false notification on startup
+          notificationManager.setInitialStatus(json.status);
         }
       })
       .catch((err: unknown) => {
@@ -102,24 +108,56 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // Polling interval (every 6 seconds when tab is active and polling is enabled)
+  // ── Service Worker: register, sync initial state, listen for messages ──────
   useEffect(() => {
-    if (!isPolling) return;
+    // Register SW and request notification permission
+    notificationManager.register().then(() => {
+      notificationManager.requestPermission();
+    });
 
+    // Relay SW messages → play sounds on the page (Web Audio requires page context)
+    const unsub = notificationManager.onMessage((event) => {
+      const msg = event.data;
+      if (!msg) return;
+
+      if (msg.type === 'PLAY_SOUND') {
+        switch (msg.sound) {
+          case 'sitDown':      soundManager.playSitDown();      break;
+          case 'standUp':      soundManager.playStandUp();      break;
+          case 'breakReminder': soundManager.playBreakReminder(); break;
+        }
+      }
+
+      // Also update React state from SW data so the UI stays fresh even in background
+      if (msg.type === 'STATUS_UPDATE' && msg.data) {
+        setData(msg.data as DashboardStatsResponse);
+      }
+    });
+
+    return unsub;
+  }, []);
+
+  // Polling interval (every 6 seconds when polling is enabled)
+  // NOTE: The Service Worker handles background polling independently.
+  // This interval only runs while the tab is foregrounded as a secondary sync.
+  useEffect(() => {
+    if (!isPolling) {
+      notificationManager.stopPolling();
+      return;
+    }
+
+    notificationManager.startPolling();
+
+    // Also poll from the page when the tab is visible (immediate responsiveness)
     const interval = setInterval(() => {
-      if (typeof document !== 'undefined' && document.hidden) return;
-      fetchStatus(true);
+      // Only fetch from the page when tab is visible to avoid duplicate network requests
+      if (typeof document !== 'undefined' && !document.hidden) {
+        fetchStatus(true);
+      }
     }, 6000);
 
     return () => clearInterval(interval);
   }, [isPolling, fetchStatus]);
-
-  // Request browser notification permission once
-  useEffect(() => {
-    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'default') {
-      Notification.requestPermission().catch(() => {});
-    }
-  }, []);
 
   // Break reminder watcher
   const activeDurationSec = data?.activeDurationSeconds ?? 0;
@@ -127,22 +165,21 @@ export default function DashboardPage() {
   const breakLimitSec = breakIntervalMin * 60;
   const shouldTriggerBreak = isSitting && breakIntervalMin > 0 && activeDurationSec >= breakLimitSec;
 
+  // Sync break interval changes to the SW
+  useEffect(() => {
+    notificationManager.setBreakInterval(breakIntervalMin);
+  }, [breakIntervalMin]);
+
   useEffect(() => {
     if (shouldTriggerBreak && !breakAlarmPlayedRef.current && !breakAlertDismissed) {
       breakAlarmPlayedRef.current = true;
+      // Play sound locally (SW plays it in background via showNotification + postMessage)
       soundManager.playBreakReminder();
-
-      // Trigger native notification if allowed
-      if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
-        try {
-          new Notification('Time for a Break! 🚶‍♂️', {
-            body: `You've been sitting for over ${breakIntervalMin} minutes. Take a quick stretch and drink some water.`,
-            icon: '/favicon.ico',
-          });
-        } catch {
-          // ignore
-        }
-      }
+      // Fallback page notification in case SW notification was blocked
+      notificationManager.showFallbackNotification(
+        'Time for a Break! 🚶‍♂️',
+        `You've been sitting for over ${breakIntervalMin} minutes. Take a quick stretch and drink some water.`
+      );
     }
   }, [shouldTriggerBreak, breakAlertDismissed, breakIntervalMin]);
 
