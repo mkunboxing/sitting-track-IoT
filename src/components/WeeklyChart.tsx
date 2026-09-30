@@ -3,106 +3,123 @@
 import React from 'react';
 import { DayStats } from '@/types/sitting';
 import { formatFriendlyDuration } from '@/lib/timeUtils';
-import { BarChart3, Calendar } from 'lucide-react';
+import { BarChart3, Flame, TrendingUp } from 'lucide-react';
 
 interface WeeklyChartProps {
   weeklyStats: DayStats[];
 }
 
 export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
-  // Find maximum seconds in the week to scale bar heights proportionally
-  const maxSeconds = Math.max(
-    ...weeklyStats.map((d) => d.totalSeconds),
-    3600 * 4 // Minimum scale of 4 hours so small bars still look proportional
-  );
+  const rawMax = Math.max(...weeklyStats.map((d) => d.totalSeconds), 0);
+  // Minimum scale = 1h so tiny bars still look proportional
+  const maxSeconds = Math.max(rawMax, 3600);
 
   const totalWeeklySeconds = weeklyStats.reduce((acc, curr) => acc + curr.totalSeconds, 0);
   const totalWeeklySessions = weeklyStats.reduce((acc, curr) => acc + curr.sessionCount, 0);
   const averageDailySeconds = Math.round(totalWeeklySeconds / 7);
 
+  const bestDay = [...weeklyStats].sort((a, b) => b.totalSeconds - a.totalSeconds)[0];
   const todayIso = new Date().toISOString().split('T')[0];
 
   return (
-    <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-6 backdrop-blur-sm shadow-md">
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-5 border-b border-zinc-800/80">
+    <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-5 backdrop-blur-sm shadow-md">
+      {/* Header */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-5 pb-4 border-b border-zinc-800/80">
         <div className="flex items-center gap-2.5">
           <div className="p-2 rounded-xl bg-purple-500/10 text-purple-400">
             <BarChart3 className="w-5 h-5" />
           </div>
           <div>
-            <h3 className="text-base font-semibold text-white">Weekly Sitting Activity</h3>
-            <p className="text-xs text-zinc-400">Past 7 days sitting distribution &amp; session volume</p>
+            <h3 className="text-sm font-semibold text-white">Weekly Sitting Activity</h3>
+            <p className="text-[11px] text-zinc-400">Daily sitting duration comparison</p>
           </div>
         </div>
-
-        <div className="flex items-center gap-4 text-xs font-mono">
-          <div className="flex items-center gap-1.5 text-zinc-400">
-            <span>Week: <strong className="text-white font-bold">{formatFriendlyDuration(totalWeeklySeconds)}</strong> ({totalWeeklySessions} sess)</span>
-          </div>
-          <div className="text-zinc-500 hidden sm:inline">|</div>
-          <div className="flex items-center gap-1.5 text-zinc-400">
-            <Calendar className="w-3.5 h-3.5 text-zinc-500" />
-            <span>Avg: <strong className="text-white font-bold">{formatFriendlyDuration(averageDailySeconds)}/day</strong></span>
-          </div>
+        <div className="flex items-center gap-2 text-xs font-mono flex-wrap">
+          <span className="px-2.5 py-1 rounded-lg bg-zinc-800 border border-zinc-700/60 text-zinc-300 whitespace-nowrap">
+            Week: <strong className="text-white">{formatFriendlyDuration(totalWeeklySeconds)}</strong>
+            <span className="text-zinc-500 ml-1">({totalWeeklySessions}s)</span>
+          </span>
+          <span className="hidden sm:inline text-zinc-500 text-[11px]">
+            Avg: <strong className="text-zinc-300">{formatFriendlyDuration(averageDailySeconds)}/day</strong>
+          </span>
         </div>
       </div>
 
-      {/* Bar Chart Display */}
-      <div className="mt-6 pt-4">
-        <div className="grid grid-cols-7 gap-2 sm:gap-4 items-end h-48 sm:h-52 px-1">
-          {weeklyStats.map((day) => {
-            const isToday = day.date === todayIso;
-            const barHeightPercent = Math.max(
-              day.totalSeconds > 0 ? 8 : 2,
-              Math.min(100, Math.round((day.totalSeconds / maxSeconds) * 100))
-            );
+      {/* Chart */}
+      <div className="flex gap-2 sm:gap-3 items-end h-44" style={{ paddingBottom: 0 }}>
+        {weeklyStats.map((day) => {
+          const isToday = day.date === todayIso;
+          const hasData = day.totalSeconds > 0;
+          const percent = hasData
+            ? Math.min(100, Math.max(6, Math.round((day.totalSeconds / maxSeconds) * 100)))
+            : 0;
 
-            return (
-              <div key={day.date} className="flex flex-col items-center h-full justify-end group">
-                {/* Hover Tooltip Details */}
-                <div className="text-center opacity-0 group-hover:opacity-100 transition-opacity duration-200 mb-2 pointer-events-none text-[11px] font-mono text-zinc-300 bg-zinc-800 px-2 py-1 rounded shadow-lg border border-zinc-700 whitespace-nowrap z-20">
-                  <p className="font-semibold text-white">{day.dayName} ({day.date.slice(5)})</p>
+          return (
+            <div key={day.date} className="flex-1 flex flex-col items-center gap-1.5 group h-full">
+              {/* Duration label above bar */}
+              <span className={`text-[9px] sm:text-[10px] font-mono tabular-nums transition-colors ${
+                isToday ? 'text-emerald-400 font-bold' : hasData ? 'text-zinc-300' : 'text-zinc-600'
+              }`}>
+                {hasData ? formatFriendlyDuration(day.totalSeconds) : '—'}
+              </span>
+
+              {/* Bar track */}
+              <div className="flex-1 w-full flex flex-col justify-end relative">
+                {/* Tooltip */}
+                <div className="absolute -top-12 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none z-30 whitespace-nowrap bg-zinc-950 border border-zinc-700 px-2 py-1 rounded-lg shadow-xl text-[11px] font-mono">
+                  <p className="font-semibold text-white">{day.dayName} {day.date.slice(5)}</p>
                   <p className="text-emerald-400">{formatFriendlyDuration(day.totalSeconds)}</p>
-                  <p className="text-zinc-400">{day.sessionCount} sessions</p>
+                  <p className="text-zinc-400">{day.sessionCount} sess</p>
                 </div>
 
-                {/* Duration text above bar */}
-                <span className="text-[10px] font-mono text-zinc-400 mb-1.5 tabular-nums">
-                  {day.totalSeconds > 0 ? formatFriendlyDuration(day.totalSeconds) : '0m'}
-                </span>
+                {/* Empty track */}
+                <div className="absolute inset-0 rounded-lg bg-zinc-800/40 border border-zinc-800/60 group-hover:border-zinc-700 transition-colors" />
 
-                {/* Bar */}
-                <div className="w-full max-w-[44px] bg-zinc-800/80 rounded-t-lg overflow-hidden flex flex-col justify-end p-0.5 border border-zinc-700/50 group-hover:border-emerald-500/50 transition-colors">
+                {/* Filled portion */}
+                {hasData && (
                   <div
-                    className={`w-full rounded-t-md transition-all duration-700 ${
+                    className={`relative w-full rounded-lg transition-all duration-700 overflow-hidden ${
                       isToday
-                        ? 'bg-gradient-to-t from-emerald-600 to-teal-400 shadow-md shadow-emerald-500/20'
-                        : day.totalSeconds > 0
-                        ? 'bg-gradient-to-t from-zinc-600 to-emerald-500/70 group-hover:from-emerald-700 group-hover:to-teal-400'
-                        : 'bg-zinc-800/40'
+                        ? 'bg-gradient-to-t from-emerald-700 to-teal-400 shadow-md shadow-emerald-500/20'
+                        : 'bg-gradient-to-t from-zinc-700 to-emerald-500/70 group-hover:to-teal-400'
                     }`}
-                    style={{ height: `${barHeightPercent}%` }}
-                  />
-                </div>
-
-                {/* Day of Week Label */}
-                <div className="mt-2.5 text-center">
-                  <span
-                    className={`text-xs font-semibold block ${
-                      isToday
-                        ? 'text-emerald-400 underline decoration-emerald-500 decoration-2 underline-offset-4'
-                        : 'text-zinc-400'
-                    }`}
+                    style={{ height: `${percent}%` }}
                   >
-                    {day.dayName}
-                  </span>
-                  <span className="text-[10px] text-zinc-500 font-mono block mt-0.5">
-                    {day.sessionCount} {day.sessionCount === 1 ? 'sess' : 'sess'}
-                  </span>
-                </div>
+                    {isToday && (
+                      <div className="absolute inset-0 bg-white/10 animate-pulse pointer-events-none" />
+                    )}
+                  </div>
+                )}
               </div>
-            );
-          })}
+
+              {/* Day name + sessions */}
+              <div className="text-center shrink-0">
+                <span className={`text-[10px] sm:text-xs font-semibold block ${
+                  isToday ? 'text-emerald-400' : 'text-zinc-400 group-hover:text-zinc-200'
+                }`}>
+                  {day.dayName}
+                </span>
+                <span className="text-[9px] text-zinc-600 font-mono block">
+                  {day.sessionCount}s
+                </span>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* Footer */}
+      <div className="mt-4 pt-3 border-t border-zinc-800/60 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-400">
+        <div className="flex items-center gap-1.5">
+          <Flame className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+          <span>
+            Best: <strong className="text-zinc-200">{bestDay?.dayName || 'N/A'}</strong>{' '}
+            ({formatFriendlyDuration(bestDay?.totalSeconds || 0)})
+          </span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          <TrendingUp className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+          <span>Target: &lt; 8h / day</span>
         </div>
       </div>
     </div>

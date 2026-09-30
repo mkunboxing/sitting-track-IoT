@@ -137,31 +137,46 @@ export function StatusCard({
             )}
           </div>
 
-          {/* Simulation / Manual Trigger Controls (helpful for testing) */}
-          <div className="flex items-center gap-2 pt-2 border-t border-zinc-800/60 w-full sm:w-auto justify-end">
-            <span className="text-[11px] text-zinc-500 mr-1 hidden sm:inline">
-              Simulate Sensor:
-            </span>
-            <button
-              type="button"
-              onClick={() => onSimulate('start')}
-              disabled={simulating || isSitting}
-              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors active:scale-[0.96]"
-              title="Simulate NodeMCU sending POST /api/sitting/start"
-            >
-              <Play className="w-3 h-3" />
-              <span>Sit Down</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => onSimulate('stop')}
-              disabled={simulating || !isSitting}
-              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-rose-600/20 text-rose-300 border border-rose-500/30 hover:bg-rose-600/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors active:scale-[0.96]"
-              title="Simulate NodeMCU sending POST /api/sitting/stop"
-            >
-              <Square className="w-3 h-3" />
-              <span>Stand Up</span>
-            </button>
+          {/* Action & Simulation Controls */}
+          <div className="flex flex-wrap items-center gap-2 pt-2 border-t border-zinc-800/60 w-full sm:w-auto justify-end">
+            {isSitting && (
+              <button
+                type="button"
+                onClick={() => onSimulate('stop')}
+                disabled={simulating}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold bg-rose-600/30 text-rose-200 border border-rose-500/50 hover:bg-rose-600/50 transition-colors active:scale-[0.96] shadow-sm animate-pulse"
+                title="If you switched off or unplugged the NodeMCU, click here to stop the timer and record the session duration"
+              >
+                <Square className="w-3.5 h-3.5 fill-current" />
+                <span>End Active Session</span>
+              </button>
+            )}
+
+            <div className="flex items-center gap-1.5">
+              <span className="text-[11px] text-zinc-500 mr-1 hidden sm:inline">
+                Simulate:
+              </span>
+              <button
+                type="button"
+                onClick={() => onSimulate('start')}
+                disabled={simulating || isSitting}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-emerald-600/20 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-600/30 disabled:opacity-30 disabled:cursor-not-allowed transition-colors active:scale-[0.96]"
+                title="Simulate NodeMCU sending POST /api/sitting/start"
+              >
+                <Play className="w-3 h-3" />
+                <span>Sit Down</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => onSimulate('stop')}
+                disabled={simulating || !isSitting}
+                className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-medium bg-zinc-800 text-zinc-300 border border-zinc-700/80 hover:bg-zinc-700 disabled:opacity-30 disabled:cursor-not-allowed transition-colors active:scale-[0.96]"
+                title="Simulate NodeMCU sending POST /api/sitting/stop"
+              >
+                <Square className="w-3 h-3" />
+                <span>Stand Up</span>
+              </button>
+            </div>
           </div>
         </div>
       </div>

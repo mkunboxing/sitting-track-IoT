@@ -58,7 +58,7 @@ export async function GET() {
     sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
 
     // 1. Fetch active session if any
-    const { data: activeSession, error: activeError } = await supabase
+    const { data: initialActive, error: activeError } = await supabase
       .from('sitting_sessions')
       .select('*')
       .is('ended_at', null)
@@ -66,8 +66,40 @@ export async function GET() {
       .limit(1)
       .maybeSingle();
 
+    let activeSession = initialActive;
+
     if (activeError) {
       console.error('[API /sitting/status] Error fetching active session:', activeError);
+    }
+
+    // Auto-detect if device was switched off (heartbeat timeout)
+    if (activeSession) {
+      const lastCheckTime = activeSession.last_heartbeat_at
+        ? new Date(activeSession.last_heartbeat_at).getTime()
+        : new Date(activeSession.started_at).getTime();
+
+      const timeSinceCheck = now.getTime() - lastCheckTime;
+      // If module has been silent for > 90 seconds (and heartbeat was established) or > 8 hours (stale safety)
+      const isStaleHeartbeat = activeSession.last_heartbeat_at && timeSinceCheck > 90 * 1000;
+      const isUnreasonablyOld = timeSinceCheck > 8 * 3600 * 1000;
+
+      if (isStaleHeartbeat || isUnreasonablyOld) {
+        const autoEndTime = activeSession.last_heartbeat_at || now.toISOString();
+        const startMs = new Date(activeSession.started_at).getTime();
+        const endMs = new Date(autoEndTime).getTime();
+        const closedDuration = Math.max(0, Math.floor((endMs - startMs) / 1000));
+
+        await supabase
+          .from('sitting_sessions')
+          .update({
+            ended_at: autoEndTime,
+            duration_seconds: closedDuration,
+          })
+          .eq('id', activeSession.id);
+
+        console.log(`[API] Auto-closed abandoned session ${activeSession.id} because module was powered off.`);
+        activeSession = null;
+      }
     }
 
     // 2. Fetch all sessions that intersect with the last 7 days (including today)

@@ -40,9 +40,28 @@
 // 1. CONFIGURATION: Wi-Fi, Server API, and Device Token
 // ==============================================================================
 
-// Replace with your Wi-Fi network credentials
-const char* WIFI_SSID     = "Mywifi";
-const char* WIFI_PASSWORD = "12343211";
+// ---------------------------------------------------------------------------
+// Multi-WiFi Configuration
+// Add as many {SSID, Password} pairs as you need.
+// The device will try each network in order and connect to the first available one.
+// If all fail it will retry from the top on each reconnect attempt.
+// ---------------------------------------------------------------------------
+struct WifiCredential {
+  const char* ssid;
+  const char* password;
+};
+
+const WifiCredential WIFI_NETWORKS[] = {
+  { "Mywifi",      "12343211"   },  // Primary network
+  { "Railwire",  "Mk727498" },  // Secondary network
+  // Add more entries here:
+  // { "OfficeWiFi", "officepass" },
+};
+
+const int WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
+
+// Timeout (ms) to wait per network before trying the next one
+const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
 
 // Server Base URL (Do NOT include trailing slash)
 // For local testing:  "http://192.168.1.100:3000"
@@ -67,6 +86,7 @@ const float SITTING_LIMIT_CM        = 100.0; // Distance <= 100 cm is sitting
 const unsigned long SITTING_CONFIRM = 2000;  // 2000 ms continuous detection to confirm sitting
 const unsigned long AWAY_CONFIRM    = 5000;  // 5000 ms continuous detection to confirm away
 const unsigned long SENSOR_INTERVAL = 700;   // 700 ms between sensor readings
+const unsigned long HEARTBEAT_INTERVAL = 30000; // Send heartbeat ping every 30s while sitting
 
 // ==============================================================================
 // 3. STATE DEFINITIONS
@@ -90,8 +110,9 @@ State pendingTargetState = STATE_AWAY;
 unsigned long lastApiAttemptTime = 0;
 const unsigned long API_RETRY_INTERVAL = 3000; // Retry every 3s if request fails
 
-// Timer for sensor reading loop
+// Timer for sensor reading loop & heartbeat
 unsigned long lastSensorReadTime = 0;
+unsigned long lastHeartbeatTime  = 0;
 
 // ==============================================================================
 // 4. FUNCTION DECLARATIONS
@@ -99,7 +120,9 @@ unsigned long lastSensorReadTime = 0;
 
 float readDistanceCm();
 bool sendStateChangeEvent(State newState);
+bool sendHeartbeat();
 void connectToWiFi();
+bool tryConnectToNetwork(const WifiCredential& net);
 
 // ==============================================================================
 // 5. SETUP
@@ -130,6 +153,10 @@ void setup() {
     potentialState = STATE_SITTING;
   } else {
     potentialState = STATE_AWAY;
+    currentState = STATE_AWAY;
+    // Startup safety check: If user isn't sitting at boot, ensure any lingering session from before power-off is closed
+    Serial.println(F("[INIT] Desk vacant on boot. Checking if dangling session needs stopping..."));
+    sendStateChangeEvent(STATE_AWAY);
   }
   potentialStateStartTime = millis();
 
@@ -211,10 +238,19 @@ void loop() {
         // Successfully recorded by backend
         currentState = pendingTargetState;
         hasPendingStateChange = false;
+        lastHeartbeatTime = now;
         Serial.println(F("[API] Event successfully synced with server."));
       } else {
         Serial.println(F("[API] Transmission failed. Will retry shortly..."));
       }
+    }
+  }
+
+  // 4. Periodic Heartbeat while Sitting (Allows server to detect if module was powered off)
+  if (currentState == STATE_SITTING && !hasPendingStateChange) {
+    if (now - lastHeartbeatTime >= HEARTBEAT_INTERVAL) {
+      lastHeartbeatTime = now;
+      sendHeartbeat();
     }
   }
 
@@ -313,34 +349,101 @@ bool sendStateChangeEvent(State newState) {
 }
 
 // ==============================================================================
-// 9. WI-FI CONNECTION & RECONNECT HANDLER
+// 9. HEARTBEAT DISPATCH (Liveness Tracking)
 // ==============================================================================
 
+bool sendHeartbeat() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+
+  String fullUrl = String(SERVER_BASE_URL) + "/api/sitting/heartbeat";
+  bool isHttps = fullUrl.startsWith("https://");
+
+  HTTPClient http;
+  if (isHttps) {
+    WiFiClientSecure secureClient;
+    secureClient.setInsecure();
+    secureClient.setTimeout(4000);
+    http.begin(secureClient, fullUrl);
+  } else {
+    WiFiClient standardClient;
+    standardClient.setTimeout(4000);
+    http.begin(standardClient, fullUrl);
+  }
+
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("Authorization", String("Bearer ") + DEVICE_TOKEN);
+  http.addHeader("User-Agent", "NodeMCU-ESP8266-SittingTracker/1.0");
+
+  int httpCode = http.POST("{}");
+  if (httpCode > 0) {
+    Serial.print(F("[HEARTBEAT] Ping sent. HTTP: "));
+    Serial.println(httpCode);
+    http.end();
+    return (httpCode >= 200 && httpCode < 300);
+  } else {
+    Serial.print(F("[HEARTBEAT] Ping failed: "));
+    Serial.println(http.errorToString(httpCode).c_str());
+    http.end();
+    return false;
+  }
+}
+
+// ==============================================================================
+// 10. WI-FI CONNECTION & RECONNECT HANDLER (Multi-Network)
+// ==============================================================================
+
+// Attempt to connect to a single network; returns true on success.
+bool tryConnectToNetwork(const WifiCredential& net) {
+  Serial.println();
+  Serial.print(F("[WIFI] Trying SSID: "));
+  Serial.println(net.ssid);
+
+  WiFi.disconnect(true);
+  delay(100);
+  WiFi.begin(net.ssid, net.password);
+
+  unsigned long startAttempt = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < WIFI_PER_NETWORK_TIMEOUT) {
+    delay(500);
+    Serial.print(F("."));
+  }
+  Serial.println();
+
+  return WiFi.status() == WL_CONNECTED;
+}
+
+// Cycles through all configured networks until one connects.
 void connectToWiFi() {
   if (WiFi.status() == WL_CONNECTED) return;
 
   Serial.println();
-  Serial.print(F("[WIFI] Connecting to "));
-  Serial.println(WIFI_SSID);
+  Serial.println(F("[WIFI] Starting multi-network scan..."));
 
   WiFi.mode(WIFI_STA);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.setAutoReconnect(false); // We handle reconnect manually for multi-AP support
 
-  unsigned long startAttempt = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
-    delay(500);
-    Serial.print(F("."));
+  for (int i = 0; i < WIFI_NETWORK_COUNT; i++) {
+    Serial.print(F("[WIFI] Attempting network "));
+    Serial.print(i + 1);
+    Serial.print(F("/"));
+    Serial.print(WIFI_NETWORK_COUNT);
+    Serial.print(F(": "));
+    Serial.println(WIFI_NETWORKS[i].ssid);
+
+    if (tryConnectToNetwork(WIFI_NETWORKS[i])) {
+      Serial.print(F("[WIFI] Connected to: "));
+      Serial.println(WIFI_NETWORKS[i].ssid);
+      Serial.print(F("[WIFI] IP Address: "));
+      Serial.println(WiFi.localIP());
+      Serial.print(F("[WIFI] Signal Strength (RSSI): "));
+      Serial.print(WiFi.RSSI());
+      Serial.println(F(" dBm"));
+      return; // Successfully connected — done
+    }
+
+    Serial.print(F("[WIFI] Failed to connect to: "));
+    Serial.println(WIFI_NETWORKS[i].ssid);
   }
 
-  Serial.println();
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.print(F("[WIFI] Connected! IP Address: "));
-    Serial.println(WiFi.localIP());
-    Serial.print(F("[WIFI] Signal Strength (RSSI): "));
-    Serial.print(WiFi.RSSI());
-    Serial.println(F(" dBm"));
-  } else {
-    Serial.println(F("[WIFI] Connection timed out. Will retry in loop."));
-  }
+  Serial.println(F("[WIFI] All networks exhausted. Will retry in next loop iteration."));
 }

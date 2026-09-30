@@ -8,8 +8,12 @@ create table if not exists public.sitting_sessions (
   started_at timestamptz not null default now(),
   ended_at timestamptz,
   duration_seconds bigint,
+  last_heartbeat_at timestamptz default now(),
   created_at timestamptz not null default now()
 );
+
+-- Migration safety: Add column if existing table was already created
+alter table public.sitting_sessions add column if not exists last_heartbeat_at timestamptz default now();
 
 -- 2. Partial unique index: Guarantee that at most ONE session can be active (ended_at IS NULL)
 -- This enforces at the database level that multiple active sessions cannot be created concurrently.

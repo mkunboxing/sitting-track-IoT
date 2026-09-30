@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { Activity, RefreshCw, Cpu, Wifi } from 'lucide-react';
+import { Activity, RefreshCw, Cpu, Wifi, Volume2, VolumeX } from 'lucide-react';
 
 interface HeaderProps {
   isPolling: boolean;
@@ -10,6 +10,8 @@ interface HeaderProps {
   onRefresh: () => void;
   lastUpdated: string;
   onOpenHardwareGuide: () => void;
+  soundEnabled: boolean;
+  onToggleSound: () => void;
 }
 
 export function Header({
@@ -19,6 +21,8 @@ export function Header({
   onRefresh,
   lastUpdated,
   onOpenHardwareGuide,
+  soundEnabled,
+  onToggleSound,
 }: HeaderProps) {
   const formattedSyncTime = lastUpdated
     ? new Date(lastUpdated).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -90,14 +94,38 @@ export function Header({
             </span>
           </button>
 
+          {/* Sound Audio Alerts toggle */}
+          <button
+            type="button"
+            onClick={onToggleSound}
+            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors active:scale-[0.96] ${
+              soundEnabled
+                ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/20'
+                : 'bg-zinc-900 text-zinc-500 border-zinc-800 hover:text-zinc-400'
+            }`}
+            title={soundEnabled ? 'Chime sound enabled on sit & stand' : 'Sound muted'}
+          >
+            {soundEnabled ? (
+              <>
+                <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+                <span>Audio On</span>
+              </>
+            ) : (
+              <>
+                <VolumeX className="w-3.5 h-3.5 text-zinc-500" />
+                <span>Muted</span>
+              </>
+            )}
+          </button>
+
           {/* Hardware & API Setup modal button */}
           <button
             type="button"
             onClick={onOpenHardwareGuide}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-emerald-500/10 text-emerald-300 border border-emerald-500/30 hover:bg-emerald-500/20 transition-colors active:scale-[0.96]"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800/90 text-zinc-300 border border-zinc-700/80 hover:bg-zinc-700/90 transition-colors active:scale-[0.96]"
           >
-            <Cpu className="w-3.5 h-3.5" />
-            <span>ESP8266 &amp; API Guide</span>
+            <Cpu className="w-3.5 h-3.5 text-teal-400" />
+            <span>ESP8266 Guide</span>
           </button>
         </div>
       </div>

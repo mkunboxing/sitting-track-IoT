@@ -39,10 +39,10 @@ export function SessionHistory({ sessions }: SessionHistoryProps) {
           </p>
         </div>
       ) : (
-        <div className="mt-4 overflow-x-auto">
+        <div className="mt-4 max-h-[380px] overflow-y-auto overflow-x-auto pr-1 rounded-xl border border-zinc-800/80 bg-zinc-950/40">
           <table className="w-full text-left text-xs">
-            <thead>
-              <tr className="border-b border-zinc-800/60 text-zinc-400 font-medium">
+            <thead className="sticky top-0 bg-zinc-900/95 backdrop-blur-md z-10 border-b border-zinc-800/90 shadow-sm">
+              <tr className="text-zinc-400 font-medium">
                 <th className="py-3 px-3">Status</th>
                 <th className="py-3 px-3">Start Time</th>
                 <th className="py-3 px-3">End Time</th>
