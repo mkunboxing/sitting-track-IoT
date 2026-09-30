@@ -1,0 +1,77 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">
+  <defs>
+    <!-- Background Gradient -->
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#091413" />
+      <stop offset="50%" stop-color="#070d0e" />
+      <stop offset="100%" stop-color="#040708" />
+    </linearGradient>
+
+    <!-- Border Gradient -->
+    <linearGradient id="borderGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#10b981" stop-opacity="0.65" />
+      <stop offset="50%" stop-color="#14b8a6" stop-opacity="0.25" />
+      <stop offset="100%" stop-color="#06b6d4" stop-opacity="0.5" />
+    </linearGradient>
+
+    <!-- Chair Emerald / Teal Gradient -->
+    <linearGradient id="chairGrad" x1="20%" y1="0%" x2="80%" y2="100%">
+      <stop offset="0%" stop-color="#34d399" />
+      <stop offset="50%" stop-color="#10b981" />
+      <stop offset="100%" stop-color="#0d9488" />
+    </linearGradient>
+
+    <!-- IoT Wave Gradient -->
+    <linearGradient id="waveGrad" x1="0%" y1="30%" x2="100%" y2="70%">
+      <stop offset="0%" stop-color="#2dd4bf" />
+      <stop offset="50%" stop-color="#38bdf8" />
+      <stop offset="100%" stop-color="#818cf8" />
+    </linearGradient>
+  </defs>
+
+  <!-- Squircle Base -->
+  <rect x="5" y="5" width="118" height="118" rx="30" fill="url(#bgGrad)" stroke="url(#borderGrad)" stroke-width="2.5" />
+
+  <!-- Ambient light glow behind chair -->
+  <circle cx="56" cy="62" r="32" fill="#10b981" opacity="0.12" />
+
+  <!-- Ergonomic Chair + Ultrasonic Waves -->
+  <g>
+    <!-- Headrest -->
+    <rect x="42" y="25" width="16" height="8" rx="4" fill="url(#chairGrad)" />
+    <!-- Headrest bar -->
+    <path d="M 50 33 L 50 38" stroke="#10b981" stroke-width="3" stroke-linecap="round" />
+
+    <!-- Ergonomic Backrest Spine S-Curve -->
+    <path d="M 50 38 C 42 44, 42 54, 47 62 C 49 66, 50 69, 49 74" 
+          fill="none" stroke="url(#chairGrad)" stroke-width="5.5" stroke-linecap="round" stroke-linejoin="round" />
+    
+    <!-- Lumbar contour line -->
+    <path d="M 44.5 56 C 46.5 58, 47.5 61, 46 64" fill="none" stroke="#6ee7b7" stroke-width="2" stroke-linecap="round" opacity="0.9" />
+
+    <!-- Seat Cushion -->
+    <path d="M 44 74 L 75 74 C 77.5 74, 79 75.5, 78 78 L 77.5 79 C 76.5 80.5, 74.5 81, 72.5 81 L 45 81 C 42.5 81, 41 78.5, 42.5 75.5 Z"
+          fill="url(#chairGrad)" />
+
+    <!-- Gas Lift Piston -->
+    <path d="M 59 81 L 59 93" stroke="#14b8a6" stroke-width="4.5" stroke-linecap="round" />
+
+    <!-- Star Base Legs -->
+    <path d="M 39 99 L 59 93 L 79 99" stroke="url(#chairGrad)" stroke-width="4.5" stroke-linecap="round" stroke-linejoin="round" />
+    <!-- Wheels -->
+    <circle cx="39" cy="99" r="2.8" fill="#34d399" />
+    <circle cx="59" cy="94" r="2.2" fill="#2dd4bf" />
+    <circle cx="79" cy="99" r="2.8" fill="#34d399" />
+
+    <!-- Telemetry HC-SR04 Wave Arcs -->
+    <!-- Arc 1 -->
+    <path d="M 83 49 A 17 17 0 0 1 83 67" fill="none" stroke="url(#waveGrad)" stroke-width="3.5" stroke-linecap="round" />
+    <!-- Arc 2 -->
+    <path d="M 93 42 A 29 29 0 0 1 93 74" fill="none" stroke="url(#waveGrad)" stroke-width="3" stroke-linecap="round" opacity="0.75" />
+    <!-- Arc 3 -->
+    <path d="M 103 35 A 41 41 0 0 1 103 81" fill="none" stroke="url(#waveGrad)" stroke-width="2.5" stroke-linecap="round" opacity="0.45" />
+
+    <!-- Presence Telemetry Beacon Dot -->
+    <circle cx="73" cy="58" r="3.2" fill="#6ee7b7" />
+  </g>
+</svg>

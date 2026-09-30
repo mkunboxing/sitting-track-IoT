@@ -7,6 +7,7 @@ import { MetricsGrid } from '@/components/MetricsGrid';
 import { WeeklyChart } from '@/components/WeeklyChart';
 import { SessionHistory } from '@/components/SessionHistory';
 import { HardwareGuideModal } from '@/components/HardwareGuideModal';
+import { Logo } from '@/components/Logo';
 import { DashboardStatsResponse } from '@/types/sitting';
 import { soundManager } from '@/lib/soundUtils';
 import { notificationManager } from '@/lib/notificationManager';
@@ -48,12 +49,27 @@ export default function DashboardPage() {
     setNotificationPermission(perm);
   };
 
+  // Helper to append client timezone parameters to status API calls
+  const getStatusEndpoint = useCallback(() => {
+    const tz = typeof Intl !== 'undefined' ? Intl.DateTimeFormat().resolvedOptions().timeZone : 'UTC';
+    const tzOffset = typeof window !== 'undefined' ? new Date().getTimezoneOffset().toString() : '0';
+    return {
+      url: `/api/sitting/status?tz=${encodeURIComponent(tz)}&tzOffset=${tzOffset}`,
+      headers: {
+        'Cache-Control': 'no-cache',
+        'x-timezone': tz,
+        'x-timezone-offset': tzOffset,
+      },
+    };
+  }, []);
+
   // Fetch status and metrics from server
   const fetchStatus = useCallback(async (isBackground = false) => {
     try {
-      const res = await fetch('/api/sitting/status', {
+      const { url, headers } = getStatusEndpoint();
+      const res = await fetch(url, {
         cache: 'no-store',
-        headers: { 'Cache-Control': 'no-cache' },
+        headers,
       });
 
       if (!res.ok) {
@@ -145,7 +161,8 @@ export default function DashboardPage() {
     window.addEventListener('keydown', unlockHandler, { passive: true });
 
     // Initial status fetch
-    fetch('/api/sitting/status', { cache: 'no-store' })
+    const endpoint = getStatusEndpoint();
+    fetch(endpoint.url, { cache: 'no-store', headers: endpoint.headers })
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         return res.json();
@@ -498,9 +515,14 @@ export default function DashboardPage() {
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-zinc-900 bg-zinc-950 py-6 text-center text-xs text-zinc-500">
-        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <p>Sitting Time Tracker • NodeMCU ESP8266 + HC-SR04 IoT Telemetry</p>
+      <footer className="border-t border-zinc-900 bg-zinc-950 py-6 text-xs text-zinc-500">
+        <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-4">
+          <div className="flex items-center gap-2.5">
+            <Logo size="xs" animated={false} />
+            <p className="font-medium text-zinc-400">
+              Sitting Time Tracker <span className="text-zinc-600">•</span> NodeMCU ESP8266 + HC-SR04 IoT Telemetry
+            </p>
+          </div>
           <p className="font-mono text-[11px] text-zinc-600">
             Background Web Worker Active • Auto-Sync 4.5s • Audio Enabled
           </p>

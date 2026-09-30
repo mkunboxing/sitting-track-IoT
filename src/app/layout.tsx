@@ -17,7 +17,15 @@ export const metadata: Metadata = {
   description:
     'Real-time IoT sitting session tracker powered by NodeMCU ESP8266 and HC-SR04 ultrasonic sensor with Supabase PostgreSQL.',
   icons: {
-    icon: '/favicon.ico',
+    icon: [
+      { url: '/icon.svg', type: 'image/svg+xml' },
+      { url: '/favicon-32x32.png', sizes: '32x32', type: 'image/png' },
+      { url: '/favicon.ico' },
+    ],
+    apple: [
+      { url: '/apple-touch-icon.png', sizes: '180x180', type: 'image/png' },
+    ],
+    shortcut: '/icon.svg',
   },
 };
 

@@ -1,30 +1,33 @@
-import { NextResponse } from 'next/server';
+import { NextRequest, NextResponse } from 'next/server';
 import { getSupabaseServerClient, isSupabaseConfigured } from '@/lib/supabaseServer';
-import { calculateSessionOverlapWithInterval } from '@/lib/timeUtils';
+import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '@/lib/timeUtils';
 import { DashboardStatsResponse, DayStats, SittingSession } from '@/types/sitting';
 
 // Force dynamic execution (never cache status API response)
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-export async function GET() {
+export async function GET(req: NextRequest) {
   const configured = isSupabaseConfigured();
+
+  // Extract client timezone from query param or header (defaults to UTC if missing)
+  const { searchParams } = new URL(req.url);
+  const tzParam = searchParams.get('tz') || req.headers.get('x-timezone');
+  const offsetParam = searchParams.get('tzOffset') || req.headers.get('x-timezone-offset');
+  const tzOffset = offsetParam !== null ? parseInt(offsetParam, 10) : null;
+
+  const now = new Date();
+  const boundaries = getTimezoneDayBoundaries(now, tzParam, tzOffset);
+  const { todayStartUtc, sevenDaysAgoUtc, weeklyIntervals } = boundaries;
 
   // If Supabase is not yet configured, return clean initial/sample state with configured: false
   if (!configured) {
-    const mockWeekly: DayStats[] = [];
-    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    const now = new Date();
-    for (let i = 6; i >= 0; i--) {
-      const d = new Date(now);
-      d.setDate(d.getDate() - i);
-      mockWeekly.push({
-        date: d.toISOString().split('T')[0],
-        dayName: dayNames[d.getDay()],
-        totalSeconds: 0,
-        sessionCount: 0,
-      });
-    }
+    const mockWeekly: DayStats[] = weeklyIntervals.map((interval) => ({
+      date: interval.date,
+      dayName: interval.dayName,
+      totalSeconds: 0,
+      sessionCount: 0,
+    }));
 
     const unconfiguredPayload: DashboardStatsResponse = {
       status: 'AWAY',
@@ -35,7 +38,7 @@ export async function GET() {
       todayLongestSessionSeconds: 0,
       todaySessions: [],
       weeklyStats: mockWeekly,
-      lastUpdated: new Date().toISOString(),
+      lastUpdated: now.toISOString(),
       configured: false,
     };
 
@@ -44,18 +47,6 @@ export async function GET() {
 
   try {
     const supabase = getSupabaseServerClient();
-    const now = new Date();
-
-    // Today's boundaries (in server/local time)
-    const todayStart = new Date(now);
-    todayStart.setHours(0, 0, 0, 0);
-
-    const todayEnd = new Date(now);
-    todayEnd.setHours(23, 59, 59, 999);
-
-    // 7 days ago boundary
-    const sevenDaysAgo = new Date(todayStart);
-    sevenDaysAgo.setDate(sevenDaysAgo.getDate() - 6);
 
     // 1. Fetch active session if any
     const { data: initialActive, error: activeError } = await supabase
@@ -103,11 +94,11 @@ export async function GET() {
     }
 
     // 2. Fetch all sessions that intersect with the last 7 days (including today)
-    // A session intersects if ended_at is null OR ended_at >= sevenDaysAgo
+    // A session intersects if ended_at is null OR ended_at >= sevenDaysAgoUtc
     const { data: recentSessions, error: recentError } = await supabase
       .from('sitting_sessions')
       .select('*')
-      .or(`ended_at.gte.${sevenDaysAgo.toISOString()},ended_at.is.null`)
+      .or(`ended_at.gte.${sevenDaysAgoUtc.toISOString()},ended_at.is.null`)
       .order('started_at', { ascending: false });
 
     if (recentError) {
@@ -127,17 +118,17 @@ export async function GET() {
       activeDurationSeconds = Math.max(0, Math.floor((now.getTime() - activeStart.getTime()) / 1000));
     }
 
-    // 3. Process Today's metrics (handling midnight overlap)
+    // 3. Process Today's metrics in the user's local timezone (handling midnight crossing)
     const todaySessions: SittingSession[] = [];
     let todayTotalSeconds = 0;
     let todayLongestSessionSeconds = 0;
 
     for (const session of allSessions) {
-      // Calculate overlap with today [todayStart, now]
+      // Calculate overlap with today's local interval [todayStartUtc, now]
       const overlapSeconds = calculateSessionOverlapWithInterval(
         session.started_at,
         session.ended_at,
-        todayStart,
+        todayStartUtc,
         now
       );
 
@@ -152,16 +143,8 @@ export async function GET() {
       }
     }
 
-    // 4. Compute Weekly Statistics (Past 7 days)
-    const dayNames = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
-    const weeklyStats: DayStats[] = [];
-
-    for (let i = 6; i >= 0; i--) {
-      const dStart = new Date(todayStart);
-      dStart.setDate(dStart.getDate() - i);
-      const dEnd = new Date(dStart);
-      dEnd.setHours(23, 59, 59, 999);
-
+    // 4. Compute Weekly Statistics (Past 7 days according to user's timezone)
+    const weeklyStats: DayStats[] = weeklyIntervals.map((interval) => {
       let dayTotal = 0;
       let dayCount = 0;
 
@@ -169,8 +152,8 @@ export async function GET() {
         const overlap = calculateSessionOverlapWithInterval(
           session.started_at,
           session.ended_at,
-          dStart,
-          dEnd
+          interval.startUtc,
+          interval.endUtc
         );
 
         if (overlap > 0) {
@@ -179,13 +162,13 @@ export async function GET() {
         }
       }
 
-      weeklyStats.push({
-        date: dStart.toISOString().split('T')[0],
-        dayName: dayNames[dStart.getDay()],
+      return {
+        date: interval.date,
+        dayName: interval.dayName,
         totalSeconds: dayTotal,
         sessionCount: dayCount,
-      });
-    }
+      };
+    });
 
     const responsePayload: DashboardStatsResponse = {
       status: activeSession ? 'SITTING' : 'AWAY',

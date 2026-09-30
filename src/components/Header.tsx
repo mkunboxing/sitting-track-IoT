@@ -1,7 +1,8 @@
 'use client';
 
 import React from 'react';
-import { Activity, RefreshCw, Cpu, Wifi, Volume2, VolumeX, Bell, BellOff } from 'lucide-react';
+import { RefreshCw, Cpu, Wifi, Volume2, VolumeX, Bell, BellOff } from 'lucide-react';
+import { Logo } from './Logo';
 
 interface HeaderProps {
   isPolling: boolean;
@@ -38,17 +39,11 @@ export function Header({
     <header className="border-b border-zinc-800/80 bg-zinc-900/60 backdrop-blur-md sticky top-0 z-30">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
         {/* Brand / Logo */}
-        <div className="flex items-center gap-3">
-          <div className="relative flex items-center justify-center w-10 h-10 rounded-xl bg-gradient-to-tr from-emerald-600 to-teal-400 shadow-lg shadow-emerald-500/20 text-white font-bold">
-            <Activity className="w-5 h-5" />
-            <span className="absolute -top-0.5 -right-0.5 flex h-2.5 w-2.5">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
-            </span>
-          </div>
+        <div className="flex items-center gap-3 group">
+          <Logo size="md" />
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-lg font-semibold tracking-tight text-white">
+              <h1 className="text-lg font-semibold tracking-tight text-white group-hover:text-emerald-300 transition-colors">
                 Sitting Time Tracker
               </h1>
               <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">

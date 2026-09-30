@@ -1,7 +1,8 @@
 'use client';
 
 import React, { useState } from 'react';
-import { X, Copy, Check, Terminal, Cpu, ShieldCheck, Zap } from 'lucide-react';
+import { X, Copy, Check, Terminal, ShieldCheck, Zap } from 'lucide-react';
+import { Logo } from './Logo';
 
 interface HardwareGuideModalProps {
   isOpen: boolean;
@@ -32,10 +33,8 @@ export function HardwareGuideModal({ isOpen, onClose }: HardwareGuideModalProps)
       <div className="relative w-full max-w-3xl max-h-[90vh] overflow-y-auto rounded-2xl border border-zinc-700 bg-zinc-900 p-6 md:p-8 shadow-2xl text-zinc-100">
         {/* Header */}
         <div className="flex items-center justify-between pb-4 border-b border-zinc-800">
-          <div className="flex items-center gap-2.5">
-            <div className="p-2 rounded-xl bg-emerald-500/10 text-emerald-400">
-              <Cpu className="w-5 h-5" />
-            </div>
+          <div className="flex items-center gap-3">
+            <Logo size="sm" animated={false} />
             <div>
               <h3 className="text-lg font-bold text-white">
                 ESP8266 &amp; HC-SR04 Hardware Setup Guide

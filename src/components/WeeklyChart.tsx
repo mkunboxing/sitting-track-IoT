@@ -19,7 +19,13 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
   const averageDailySeconds = Math.round(totalWeeklySeconds / 7);
 
   const bestDay = [...weeklyStats].sort((a, b) => b.totalSeconds - a.totalSeconds)[0];
-  const todayIso = new Date().toISOString().split('T')[0];
+  const todayLocalDate = (() => {
+    const d = new Date();
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  })();
 
   return (
     <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-5 backdrop-blur-sm shadow-md">
@@ -47,8 +53,8 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
 
       {/* Chart */}
       <div className="flex gap-2 sm:gap-3 items-end h-44" style={{ paddingBottom: 0 }}>
-        {weeklyStats.map((day) => {
-          const isToday = day.date === todayIso;
+        {weeklyStats.map((day, index) => {
+          const isToday = day.date === todayLocalDate || index === weeklyStats.length - 1;
           const hasData = day.totalSeconds > 0;
           const percent = hasData
             ? Math.min(100, Math.max(6, Math.round((day.totalSeconds / maxSeconds) * 100)))
