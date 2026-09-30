@@ -47,7 +47,7 @@ const char* WIFI_PASSWORD = "12343211";
 // Server Base URL (Do NOT include trailing slash)
 // For local testing:  "http://192.168.1.100:3000"
 // For live Vercel:    "https://your-sitting-tracker.vercel.app"
-const char* SERVER_BASE_URL = "https://your-sitting-tracker.vercel.app";
+const char* SERVER_BASE_URL = "https://sitting-track-iot.vercel.app";
 
 // Secret Device Authentication Token (must match DEVICE_TOKEN in your .env.local / Vercel)
 const char* DEVICE_TOKEN    = "515e0200-a088-4c67-b6fc-3dc9cfb941d3";
