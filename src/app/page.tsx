@@ -10,7 +10,9 @@ import { HardwareGuideModal } from '@/components/HardwareGuideModal';
 import { DashboardStatsResponse } from '@/types/sitting';
 import { soundManager } from '@/lib/soundUtils';
 import { notificationManager } from '@/lib/notificationManager';
-import { Bell, Flame, ShieldAlert, Sparkles, X, HeartPulse } from 'lucide-react';
+import { backgroundTimer } from '@/lib/backgroundTimer';
+import { formatFriendlyDuration } from '@/lib/timeUtils';
+import { Bell, Flame, ShieldAlert, Sparkles, X, HeartPulse, Volume2 } from 'lucide-react';
 
 export default function DashboardPage() {
   const [data, setData] = useState<DashboardStatsResponse | null>(null);
@@ -20,9 +22,12 @@ export default function DashboardPage() {
   const [showHardwareGuide, setShowHardwareGuide] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
-  // Sound settings
+  // Sound & Notification settings
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
+  const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>('default');
+  const [bannerDismissed, setBannerDismissed] = useState<boolean>(false);
   const previousStatusRef = useRef<string | null>(null);
+  const previousDurationRef = useRef<number>(0);
 
   // Break Reminder settings (in minutes: 30, 45, 60 or 0 to disable)
   const [breakIntervalMin, setBreakIntervalMin] = useState<number>(45);
@@ -34,6 +39,13 @@ export default function DashboardPage() {
     const nextState = !soundEnabled;
     soundManager.setEnabled(nextState);
     setSoundEnabled(nextState);
+  };
+
+  // Request notifications and unlock audio engine
+  const handleEnableAlerts = async () => {
+    soundManager.unlock();
+    const perm = await notificationManager.requestPermission();
+    setNotificationPermission(perm);
   };
 
   // Fetch status and metrics from server
@@ -52,21 +64,51 @@ export default function DashboardPage() {
       setData(json);
       setErrorMessage(null);
 
-      // Sound alert on state transition (page-side, when tab is visible)
-      // The SW handles background sound relay via postMessage when the tab is hidden.
-      if (previousStatusRef.current !== null && previousStatusRef.current !== json.status) {
-        if (json.status === 'SITTING') {
-          // Only play from page if SW hasn't already triggered it (tab was visible)
-          if (!document.hidden) soundManager.playSitDown();
-        } else if (json.status === 'AWAY') {
-          if (!document.hidden) soundManager.playStandUp();
-          // Reset break alarm when user stands up
+      const currentStatus = json.status;
+      const prevStatus = previousStatusRef.current;
+
+      // Detect status transitions
+      if (prevStatus !== null && prevStatus !== currentStatus) {
+        if (currentStatus === 'SITTING') {
+          // 1. Play sit-down sound (plays reliably in background tabs via HTMLAudioElement)
+          soundManager.playSitDown();
+
+          // 2. Fire system notification for session start
+          notificationManager.notify('🪑 Sitting Session Started', {
+            body: 'Ultrasonic desk sensor detected you sitting down. Tracking has begun!',
+            tag: 'sitting-status-change',
+          });
+
+          // Reset break alarm for the new session
           setBreakAlertDismissed(false);
           breakAlarmPlayedRef.current = false;
-          notificationManager.resetBreakAlarm();
+
+        } else if (currentStatus === 'AWAY') {
+          // 1. Play stand-up sound
+          soundManager.playStandUp();
+
+          // 2. Calculate duration of the session that just finished
+          const durationSec = json.activeDurationSeconds || previousDurationRef.current || 0;
+          const durationStr = formatFriendlyDuration(durationSec);
+
+          // 3. Fire system notification for session stop
+          notificationManager.notify('🚶 Session Ended – You Stood Up!', {
+            body: durationSec > 0
+              ? `You were sitting for ${durationStr}. Great work taking a break to stretch!`
+              : 'Desk is now vacant. Keep moving and stay active!',
+            tag: 'sitting-status-change',
+          });
+
+          // Reset break alarm
+          setBreakAlertDismissed(false);
+          breakAlarmPlayedRef.current = false;
         }
       }
-      previousStatusRef.current = json.status;
+
+      previousStatusRef.current = currentStatus;
+      if (json.activeDurationSeconds) {
+        previousDurationRef.current = json.activeDurationSeconds;
+      }
     } catch (err: unknown) {
       console.error('Failed to fetch sitting status:', err);
       setErrorMessage(
@@ -79,9 +121,30 @@ export default function DashboardPage() {
     }
   }, []);
 
-  // Initial load
+  // Initial load & setup listeners
   useEffect(() => {
     let ignore = false;
+
+    // Register service worker for background OS notifications
+    notificationManager.register();
+
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      setNotificationPermission(Notification.permission);
+    }
+
+    // Auto-unlock audio and permission state on user interaction
+    const unlockHandler = () => {
+      soundManager.unlock();
+      if (typeof window !== 'undefined' && 'Notification' in window) {
+        setNotificationPermission(Notification.permission);
+      }
+    };
+
+    window.addEventListener('click', unlockHandler, { passive: true });
+    window.addEventListener('touchstart', unlockHandler, { passive: true });
+    window.addEventListener('keydown', unlockHandler, { passive: true });
+
+    // Initial status fetch
     fetch('/api/sitting/status', { cache: 'no-store' })
       .then((res) => {
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
@@ -91,9 +154,10 @@ export default function DashboardPage() {
         if (!ignore) {
           setData(json);
           previousStatusRef.current = json.status;
+          if (json.activeDurationSeconds) {
+            previousDurationRef.current = json.activeDurationSeconds;
+          }
           setIsLoading(false);
-          // Tell SW the current status so it doesn't fire a false notification on startup
-          notificationManager.setInitialStatus(json.status);
         }
       })
       .catch((err: unknown) => {
@@ -105,58 +169,28 @@ export default function DashboardPage() {
 
     return () => {
       ignore = true;
+      window.removeEventListener('click', unlockHandler);
+      window.removeEventListener('touchstart', unlockHandler);
+      window.removeEventListener('keydown', unlockHandler);
     };
   }, []);
 
-  // ── Service Worker: register, sync initial state, listen for messages ──────
-  useEffect(() => {
-    // Register SW and request notification permission
-    notificationManager.register().then(() => {
-      notificationManager.requestPermission();
-    });
-
-    // Relay SW messages → play sounds on the page (Web Audio requires page context)
-    const unsub = notificationManager.onMessage((event) => {
-      const msg = event.data;
-      if (!msg) return;
-
-      if (msg.type === 'PLAY_SOUND') {
-        switch (msg.sound) {
-          case 'sitDown':      soundManager.playSitDown();      break;
-          case 'standUp':      soundManager.playStandUp();      break;
-          case 'breakReminder': soundManager.playBreakReminder(); break;
-        }
-      }
-
-      // Also update React state from SW data so the UI stays fresh even in background
-      if (msg.type === 'STATUS_UPDATE' && msg.data) {
-        setData(msg.data as DashboardStatsResponse);
-      }
-    });
-
-    return unsub;
-  }, []);
-
-  // Polling interval (every 6 seconds when polling is enabled)
-  // NOTE: The Service Worker handles background polling independently.
-  // This interval only runs while the tab is foregrounded as a secondary sync.
+  // Background polling: runs every 4.5 seconds via dedicated Web Worker.
+  // Dedicated Web Workers bypass Chrome's background tab timer throttling completely,
+  // ensuring telemetry is checked whether the tab is focused, minimized, or in the background.
   useEffect(() => {
     if (!isPolling) {
-      notificationManager.stopPolling();
+      backgroundTimer.stop();
       return;
     }
 
-    notificationManager.startPolling();
+    backgroundTimer.start(4500, () => {
+      fetchStatus(true);
+    });
 
-    // Also poll from the page when the tab is visible (immediate responsiveness)
-    const interval = setInterval(() => {
-      // Only fetch from the page when tab is visible to avoid duplicate network requests
-      if (typeof document !== 'undefined' && !document.hidden) {
-        fetchStatus(true);
-      }
-    }, 6000);
-
-    return () => clearInterval(interval);
+    return () => {
+      backgroundTimer.stop();
+    };
   }, [isPolling, fetchStatus]);
 
   // Break reminder watcher
@@ -165,21 +199,18 @@ export default function DashboardPage() {
   const breakLimitSec = breakIntervalMin * 60;
   const shouldTriggerBreak = isSitting && breakIntervalMin > 0 && activeDurationSec >= breakLimitSec;
 
-  // Sync break interval changes to the SW
-  useEffect(() => {
-    notificationManager.setBreakInterval(breakIntervalMin);
-  }, [breakIntervalMin]);
-
   useEffect(() => {
     if (shouldTriggerBreak && !breakAlarmPlayedRef.current && !breakAlertDismissed) {
       breakAlarmPlayedRef.current = true;
-      // Play sound locally (SW plays it in background via showNotification + postMessage)
+
+      // Play alert chime (works in background tabs via HTMLAudioElement)
       soundManager.playBreakReminder();
-      // Fallback page notification in case SW notification was blocked
-      notificationManager.showFallbackNotification(
-        'Time for a Break! 🚶‍♂️',
-        `You've been sitting for over ${breakIntervalMin} minutes. Take a quick stretch and drink some water.`
-      );
+
+      // Fire native OS notification
+      notificationManager.notify('⏰ Time for a Stretch Break!', {
+        body: `You've been sitting for over ${breakIntervalMin} minutes. Take a quick stretch and drink some water.`,
+        tag: 'break-reminder',
+      });
     }
   }, [shouldTriggerBreak, breakAlertDismissed, breakIntervalMin]);
 
@@ -208,7 +239,7 @@ export default function DashboardPage() {
 
   return (
     <div className="min-h-screen flex flex-col bg-zinc-950 text-zinc-100">
-      {/* Header with live sync & sound controls */}
+      {/* Header with live sync, notification permission & sound controls */}
       <Header
         isPolling={isPolling}
         setIsPolling={setIsPolling}
@@ -218,10 +249,49 @@ export default function DashboardPage() {
         onOpenHardwareGuide={() => setShowHardwareGuide(true)}
         soundEnabled={soundEnabled}
         onToggleSound={handleToggleSound}
+        notificationPermission={notificationPermission}
+        onRequestNotificationPermission={handleEnableAlerts}
       />
 
       {/* Main Container */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-6 sm:py-8 space-y-6 sm:space-y-8">
+        {/* Enable background alerts banner if notification permission is not yet granted */}
+        {notificationPermission !== 'granted' && !bannerDismissed && (
+          <div className="p-4 rounded-2xl bg-gradient-to-r from-emerald-500/15 via-teal-500/10 to-transparent border border-emerald-500/30 flex items-center justify-between gap-4 shadow-lg shadow-emerald-500/5">
+            <div className="flex items-center gap-3">
+              <div className="p-2.5 rounded-xl bg-emerald-500/20 text-emerald-300 shrink-0">
+                <Bell className="w-5 h-5 animate-bounce" />
+              </div>
+              <div>
+                <h4 className="text-sm font-semibold text-emerald-200">
+                  Enable Background Audio &amp; System Notifications
+                </h4>
+                <p className="text-xs text-zinc-400 mt-0.5">
+                  Allow browser notifications so you hear sound chimes and get alerts when sitting starts, stops, or when it's time for a stretch break even while browsing other tabs.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={handleEnableAlerts}
+                className="px-3.5 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-zinc-950 font-bold text-xs transition-colors shadow active:scale-[0.96]"
+              >
+                Allow Alerts
+              </button>
+              <button
+                type="button"
+                onClick={() => setBannerDismissed(true)}
+                className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
+                title="Dismiss banner"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        )}
+
         {/* Error notification banner if any */}
         {errorMessage && (
           <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center justify-between">
@@ -388,7 +458,7 @@ export default function DashboardPage() {
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
           <p>Sitting Time Tracker • NodeMCU ESP8266 + HC-SR04 IoT Telemetry</p>
           <p className="font-mono text-[11px] text-zinc-600">
-            Debounce: 2s Sitting / 5s Away • Loop Delay: ~700ms
+            Background Web Worker Active • Auto-Sync 4.5s • Audio Enabled
           </p>
         </div>
       </footer>
