@@ -9,8 +9,11 @@
  *   node scripts/ws-device-simulator.mjs <command> [options]
  *
  * Commands:
- *   sit        connect, authenticate, send state_change: sitting, wait, exit
- *   away       connect, authenticate, send state_change: away, wait, exit
+ *   sit        connect, authenticate, send state_change: sitting (legacy → attentive), wait, exit
+ *   away       connect, authenticate, send state_change: away (legacy → vacant), wait, exit
+ *   relax      connect, authenticate, send state_change: relaxing, wait, exit
+ *   attentive  connect, authenticate, send state_change: attentive, wait, exit
+ *   vacant     connect, authenticate, send state_change: vacant, wait, exit
  *   crash      connect, authenticate, sit, then hard-drop the socket
  *              (simulates powering off — backend should auto-close the session)
  *   reconnect  sit → hard-drop → reconnect + re-auth (syncs current state)
@@ -120,8 +123,9 @@ class Device {
 }
 
 async function main() {
-  if (!command || !['sit', 'away', 'crash', 'reconnect', 'badtoken', 'malformed', 'twice', 'ping', 'sensor'].includes(command)) {
-    console.log('Usage: node scripts/ws-device-simulator.mjs <sit|away|crash|reconnect|badtoken|malformed|twice|ping|sensor> [--url=...] [--token=...] [--id=...]');
+  const postureCommands = { relax: 'relaxing', attentive: 'attentive', vacant: 'vacant' };
+  if (!command || !['sit', 'away', 'relax', 'attentive', 'vacant', 'crash', 'reconnect', 'badtoken', 'malformed', 'twice', 'ping', 'sensor'].includes(command)) {
+    console.log('Usage: node scripts/ws-device-simulator.mjs <sit|away|relax|attentive|vacant|crash|reconnect|badtoken|malformed|twice|ping|sensor> [--url=...] [--token=...] [--id=...]');
     process.exit(1);
   }
   if (!token) {
@@ -129,8 +133,8 @@ async function main() {
     process.exit(1);
   }
 
-  if (command === 'sit' || command === 'away') {
-    const state = command === 'sit' ? 'sitting' : 'away';
+  if (command === 'sit' || command === 'away' || postureCommands[command]) {
+    const state = command === 'sit' ? 'sitting' : command === 'away' ? 'away' : postureCommands[command];
     const d = new Device(deviceId);
     await d.connect();
     d.authenticate();
@@ -240,7 +244,9 @@ async function main() {
     d.authenticate();
     if (!(await d.waitAuth())) { console.error('FAILED: not authenticated'); process.exit(1); }
     console.log('Streaming sensor readings every 2s for 10s (watch the dashboard distance / SSE stream)...');
-    const readings = [82.5, 84.0, 79.3, 121.2, -1.0];
+    // Covers each posture band: relaxing (<4.5), attentive (5–45), deadband
+    // (4.5–5), vacant (>45), invalid (sensor timeout)
+    const readings = [3.2, 20.0, 4.7, 60.0, -1.0];
     for (let i = 0; i < 5; i++) {
       d.send({ type: 'sensor', deviceId: d.id, distance: readings[i] });
       await sleep(2000);

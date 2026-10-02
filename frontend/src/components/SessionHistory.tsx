@@ -46,6 +46,7 @@ export function SessionHistory({ sessions }: SessionHistoryProps) {
                 <th className="py-3 px-3">Status</th>
                 <th className="py-3 px-3">Start Time</th>
                 <th className="py-3 px-3">End Time</th>
+                <th className="py-3 px-3">Posture Split</th>
                 <th className="py-3 px-3 text-right">Duration</th>
               </tr>
             </thead>
@@ -53,6 +54,21 @@ export function SessionHistory({ sessions }: SessionHistoryProps) {
               {sessions.map((session, index) => {
                 const isActive = session.ended_at === null;
                 const durationSec = session.duration_seconds ?? 0;
+
+                // Snapshot of the posture split: completed columns plus the
+                // running stretch for the active session (refreshed on every
+                // status fetch)
+                const postureSinceMs = session.posture_changed_at
+                  ? new Date(session.posture_changed_at).getTime()
+                  : new Date(session.started_at).getTime();
+                const stretchSec = isActive
+                  ? Math.max(0, Math.floor((Date.now() - postureSinceMs) / 1000))
+                  : 0;
+                const relaxSec = (session.relax_seconds ?? 0) +
+                  (isActive && session.posture_state === 'relaxing' ? stretchSec : 0);
+                const attentiveSec = (session.attentive_seconds ?? 0) +
+                  (isActive && session.posture_state === 'attentive' ? stretchSec : 0);
+                const hasSplit = relaxSec > 0 || attentiveSec > 0;
 
                 return (
                   <tr
@@ -85,6 +101,28 @@ export function SessionHistory({ sessions }: SessionHistoryProps) {
                         <span className="text-emerald-400 italic">In progress...</span>
                       ) : (
                         formatTimeOnly(session.ended_at!)
+                      )}
+                    </td>
+
+                    {/* Posture Split */}
+                    <td className="py-3.5 px-3 whitespace-nowrap">
+                      {!hasSplit ? (
+                        <span className="text-zinc-600">—</span>
+                      ) : (
+                        <div className="flex flex-col gap-0.5">
+                          {attentiveSec > 0 && (
+                            <span className="inline-flex items-center gap-1.5 text-emerald-300">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+                              A&nbsp;{formatFriendlyDuration(attentiveSec)}
+                            </span>
+                          )}
+                          {relaxSec > 0 && (
+                            <span className="inline-flex items-center gap-1.5 text-sky-300">
+                              <span className="w-1.5 h-1.5 rounded-full bg-sky-400 shrink-0" />
+                              R&nbsp;{formatFriendlyDuration(relaxSec)}
+                            </span>
+                          )}
+                        </div>
                       )}
                     </td>
 

@@ -18,16 +18,19 @@
  *                                           |
  *                                          GND
  *
- * Logic & Timing Specifications (unchanged from the HTTP firmware):
- *   - SITTING_LIMIT_CM     = 120 cm (distance <= threshold is sitting)
- *   - SITTING_CONFIRM_TIME = 2000 ms continuous detection to confirm sitting
- *   - AWAY_CONFIRM_TIME    = 5000 ms continuous detection to confirm away
- *   - SENSOR_INTERVAL      = 700 ms  (ultrasonic ping interval)
+ * Logic & Timing Specifications (posture tracking):
+ *   - RELAX_ENTER_CM     = 4.5 cm (distance < threshold is relaxing)
+ *   - ATTENTIVE_ENTER_CM = 5 cm   (4.5–5 cm is a deadband: hold previous state)
+ *   - OCCUPANCY_LIMIT_CM = 45 cm  (distance <= threshold is occupied)
+ *   - OCCUPIED_CONFIRM   = 2000 ms continuous detection to confirm relaxing/attentive
+ *   - VACANT_CONFIRM     = 5000 ms continuous detection to confirm vacant
+ *   - SENSOR_INTERVAL    = 700 ms  (ultrasonic ping interval)
  *
  * Communication (WebSocket — replaces the old HTTP start/stop/heartbeat):
  *   - Persistent JSON WebSocket connection to the Node.js backend
  *   - Path: /ws/device  — first message must authenticate with DEVICE_TOKEN
- *   - On confirmed state transition: { "type": "state_change", ... }
+ *   - On confirmed state transition: { "type": "state_change",
+ *         "state": "relaxing" | "attentive" | "vacant" }
  *   - If offline during a transition: the CURRENT state is held locally and
  *     synced automatically right after the next successful authentication
  *     (never replays stale events — only the latest state is sent)
@@ -143,10 +146,17 @@ const char* DEVICE_TOKEN = "515e0200-a088-4c67-b6fc-3dc9cfb941d3";
 const int PIN_TRIG = 12; // D6
 const int PIN_ECHO = 14; // D5
 
-// Detection Thresholds
-const float SITTING_LIMIT_CM        = 120.0; // Distance <= 120 cm is sitting
-const unsigned long SITTING_CONFIRM = 2000;  // 2000 ms continuous detection to confirm sitting
-const unsigned long AWAY_CONFIRM    = 5000;  // 5000 ms continuous detection to confirm away
+// Posture Detection Thresholds
+//   distance <  4.5  → RELAXING
+//   4.5 … 5          → deadband: keep the previous state (hysteresis, so
+//                      readings hovering at the boundary don't flap)
+//   5 < distance ≤ 45 → ATTENTIVE
+//   distance > 45 or invalid → VACANT (desk unoccupied)
+const float RELAX_ENTER_CM          = 4.5;   // Distance < 4.5 cm is relaxing
+const float ATTENTIVE_ENTER_CM      = 5.0;   // Distance > 5 cm (and <= 45) is attentive
+const float OCCUPANCY_LIMIT_CM      = 45.0;  // Distance > 45 cm is vacant
+const unsigned long OCCUPIED_CONFIRM = 2000; // 2000 ms continuous to confirm relaxing/attentive
+const unsigned long VACANT_CONFIRM   = 5000; // 5000 ms continuous to confirm vacant
 const unsigned long SENSOR_INTERVAL = 700;   // 700 ms between sensor readings
 
 // Live distance telemetry: send the latest reading to the dashboard every 5s
@@ -170,15 +180,16 @@ const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
 // ==============================================================================
 
 enum State {
-  STATE_AWAY,
-  STATE_SITTING
+  STATE_VACANT,
+  STATE_RELAXING,
+  STATE_ATTENTIVE
 };
 
 // Current confirmed state
-State currentState = STATE_AWAY;
+State currentState = STATE_VACANT;
 
 // Potential state being evaluated for debounce
-State potentialState = STATE_AWAY;
+State potentialState = STATE_VACANT;
 unsigned long potentialStateStartTime = 0;
 
 // WebSocket session state
@@ -195,6 +206,7 @@ float lastMeasuredDistanceCm = -1.0;       // latest reading, sent as telemetry
 // ==============================================================================
 
 float readDistanceCm();
+const char* stateName(State s);
 void sendStateChange(State newState);
 void sendSensorReading();
 void sendAuthenticate();
@@ -262,14 +274,16 @@ void setup() {
   Serial.print(initialDistance);
   Serial.println(F(" cm"));
 
-  if (initialDistance > 0 && initialDistance <= SITTING_LIMIT_CM) {
-    potentialState = STATE_SITTING;
+  // Same classification as loop(): < 4.5 relaxing, 4.5–5 deadband (treat as
+  // attentive on boot), 5–45 attentive, > 45 / invalid vacant
+  if (initialDistance > 0 && initialDistance <= OCCUPANCY_LIMIT_CM) {
+    potentialState = (initialDistance < RELAX_ENTER_CM) ? STATE_RELAXING : STATE_ATTENTIVE;
   } else {
-    potentialState = STATE_AWAY;
-    currentState = STATE_AWAY;
+    potentialState = STATE_VACANT;
+    currentState = STATE_VACANT;
     // Startup safety check: if a session is dangling from a previous power-off,
-    // the post-authentication state sync (state "away") closes it on the server.
-    Serial.println(F("[INIT] Desk vacant on boot. Current state (away) will sync after WebSocket authentication."));
+    // the post-authentication state sync (state "vacant") closes it on the server.
+    Serial.println(F("[INIT] Desk vacant on boot. Current state (vacant) will sync after WebSocket authentication."));
   }
   potentialStateStartTime = millis();
 
@@ -308,12 +322,24 @@ void loop() {
       Serial.print(F(" cm"));
     }
     Serial.print(F(" | Current: "));
-    Serial.print(currentState == STATE_SITTING ? F("SITTING") : F("AWAY"));
+    Serial.print(stateName(currentState));
 
-    // Determine instantaneous reading:
-    // Valid distance <= threshold means person is at desk
-    // Distance above threshold or negative (no echo / out of range) means away
-    State measuredState = (distance > 0 && distance <= SITTING_LIMIT_CM) ? STATE_SITTING : STATE_AWAY;
+    // Determine instantaneous posture (with 4.5–5 cm hysteresis deadband):
+    //   Valid distance < 4.5 cm            → relaxing
+    //   Distance in the 4.5–5 cm deadband  → hold the current state (a vacant
+    //                                        device reads the deadband as attentive)
+    //   5 cm < distance <= 45 cm           → attentive
+    //   Distance > 45 cm or negative (no echo / out of range) → vacant
+    State measuredState;
+    if (distance <= 0 || distance > OCCUPANCY_LIMIT_CM) {
+      measuredState = STATE_VACANT;
+    } else if (distance < RELAX_ENTER_CM) {
+      measuredState = STATE_RELAXING;
+    } else if (distance > ATTENTIVE_ENTER_CM) {
+      measuredState = STATE_ATTENTIVE;
+    } else {
+      measuredState = (currentState == STATE_VACANT) ? STATE_ATTENTIVE : currentState;
+    }
 
     // Check if the measured state is different from potential state being debounced
     if (measuredState != potentialState) {
@@ -321,17 +347,17 @@ void loop() {
       potentialState = measuredState;
       potentialStateStartTime = now;
       Serial.print(F(" -> Potential shift to: "));
-      Serial.print(potentialState == STATE_SITTING ? F("SITTING") : F("AWAY"));
+      Serial.print(stateName(potentialState));
     } else {
       // Measured state matches potential state; check if threshold duration reached
       unsigned long duration = now - potentialStateStartTime;
-      unsigned long requiredDuration = (potentialState == STATE_SITTING) ? SITTING_CONFIRM : AWAY_CONFIRM;
+      unsigned long requiredDuration = (potentialState == STATE_VACANT) ? VACANT_CONFIRM : OCCUPIED_CONFIRM;
 
       if (duration >= requiredDuration && potentialState != currentState) {
         // State change is confirmed!
         Serial.println();
         Serial.print(F(">>> [STATE CHANGED] Confirmed transition to: "));
-        Serial.println(potentialState == STATE_SITTING ? F("SITTING") : F("AWAY"));
+        Serial.println(stateName(potentialState));
 
         currentState = potentialState;
         sendStateChange(currentState);
@@ -456,6 +482,15 @@ void sendAuthenticate() {
   webSocket.sendTXT(payload);
 }
 
+/** Wire/serial name for a state — matches the backend's state_change vocabulary */
+const char* stateName(State s) {
+  switch (s) {
+    case STATE_RELAXING:  return "relaxing";
+    case STATE_ATTENTIVE: return "attentive";
+    default:              return "vacant";
+  }
+}
+
 /**
  * Send the given state to the backend. If the socket is not (yet)
  * authenticated, nothing is transmitted — the state is already reflected in
@@ -472,11 +507,11 @@ void sendStateChange(State newState) {
   char payload[128];
   snprintf(payload, sizeof(payload),
            "{\"type\":\"state_change\",\"deviceId\":\"%s\",\"state\":\"%s\"}",
-           DEVICE_ID, (newState == STATE_SITTING) ? "sitting" : "away");
+           DEVICE_ID, stateName(newState));
 
   if (webSocket.sendTXT(payload)) {
     Serial.print(F("[WS] State sent: "));
-    Serial.println(newState == STATE_SITTING ? F("sitting") : F("away"));
+    Serial.println(stateName(newState));
   } else {
     Serial.println(F("[WS] Send failed — state held locally, will sync after reconnect"));
   }
@@ -499,16 +534,15 @@ void sendSensorReading() {
 /**
  * Called right after every successful authentication: syncs the CURRENT
  * confirmed state (not old queued events). Server-side handling is idempotent:
- * - "sitting" with an active session  → no-op (no duplicate session)
- * - "sitting" without a session       → session opened now
- * - "away" without a session          → no-op (also closes dangling sessions
- *                                       after a power-off while the server
- *                                       was not connected... handled by
- *                                       disconnect logic on the server)
+ * - "relaxing"/"attentive" with an active session → posture updated (no-op if same)
+ * - "relaxing"/"attentive" without a session      → session opened now
+ * - "vacant" without a session                    → no-op (also closes dangling
+ *   sessions after a power-off while the server was not connected... handled by
+ *   disconnect logic on the server)
  */
 void syncCurrentState() {
   Serial.print(F("[WS] Syncing current state: "));
-  Serial.println(currentState == STATE_SITTING ? F("sitting") : F("away"));
+  Serial.println(stateName(currentState));
   sendStateChange(currentState);
 }
 

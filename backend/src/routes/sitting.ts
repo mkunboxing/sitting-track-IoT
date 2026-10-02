@@ -2,7 +2,13 @@ import { Router } from 'express';
 import { getSupabaseServerClient, isSupabaseConfigured } from '../lib/supabase';
 import { requireDeviceToken } from '../lib/auth';
 import { eventBroadcaster } from '../lib/eventBroadcaster';
-import { openSession, closeActiveSession } from '../lib/sessionService';
+import {
+  openSession,
+  closeActiveSession,
+  setPosture,
+  accumulatePosture,
+  currentPostureStretchSeconds,
+} from '../lib/sessionService';
 import { getLatestSensorReading } from '../ws/deviceGateway';
 import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '../lib/timeUtils';
 import type { DashboardStatsResponse, DayStats, SittingSession } from '../types/sitting';
@@ -14,6 +20,41 @@ function singleQuery(value: unknown): string | null {
   if (typeof value === 'string') return value;
   if (Array.isArray(value) && typeof value[0] === 'string') return value[0];
   return null;
+}
+
+/**
+ * Split a session's overlap with a time window into relax/attentive seconds.
+ * The active session's running posture stretch (not yet flushed to the DB) is
+ * included; the share is proportional when a session crosses the window edge
+ * (e.g. midnight). Leftover time belongs to unclassified (legacy) sessions.
+ */
+function postureShareSeconds(
+  session: SittingSession,
+  overlapSeconds: number,
+  now: Date
+): { relax: number; attentive: number } {
+  if (overlapSeconds <= 0) return { relax: 0, attentive: 0 };
+
+  let relax: number;
+  let attentive: number;
+  let totalDuration: number;
+
+  if (session.ended_at === null) {
+    const stretch = currentPostureStretchSeconds(session, now);
+    relax = (session.relax_seconds ?? 0) + (session.posture_state === 'relaxing' ? stretch : 0);
+    attentive = (session.attentive_seconds ?? 0) + (session.posture_state === 'attentive' ? stretch : 0);
+    totalDuration = Math.max(1, Math.floor((now.getTime() - new Date(session.started_at).getTime()) / 1000));
+  } else {
+    relax = session.relax_seconds ?? 0;
+    attentive = session.attentive_seconds ?? 0;
+    totalDuration = session.duration_seconds ?? overlapSeconds;
+  }
+
+  if (totalDuration <= 0) return { relax: 0, attentive: 0 };
+  const share = Math.min(1, overlapSeconds / totalDuration);
+  relax = Math.min(overlapSeconds, Math.round(relax * share));
+  attentive = Math.min(overlapSeconds - relax, Math.round(attentive * share));
+  return { relax, attentive };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -41,13 +82,20 @@ sittingRouter.get('/status', async (req, res) => {
       dayName: interval.dayName,
       totalSeconds: 0,
       sessionCount: 0,
+      relaxSeconds: 0,
+      attentiveSeconds: 0,
+      unclassifiedSeconds: 0,
     }));
 
     const unconfiguredPayload: DashboardStatsResponse = {
       status: 'AWAY',
       activeSession: null,
       activeDurationSeconds: 0,
+      activeRelaxSeconds: 0,
+      activeAttentiveSeconds: 0,
       todayTotalSeconds: 0,
+      todayRelaxSeconds: 0,
+      todayAttentiveSeconds: 0,
       todaySessionCount: 0,
       todayLongestSessionSeconds: 0,
       todaySessions: [],
@@ -96,11 +144,18 @@ sittingRouter.get('/status', async (req, res) => {
         const endMs = new Date(autoEndTime).getTime();
         const closedDuration = Math.max(0, Math.floor((endMs - startMs) / 1000));
 
+        // Flush the running posture stretch up to last contact before closing
+        const postureTotals = accumulatePosture(activeSession, new Date(autoEndTime));
+
         await supabase
           .from('sitting_sessions')
           .update({
             ended_at: autoEndTime,
             duration_seconds: closedDuration,
+            posture_state: null,
+            posture_changed_at: null,
+            relax_seconds: postureTotals.relaxSeconds,
+            attentive_seconds: postureTotals.attentiveSeconds,
           })
           .eq('id', activeSession.id);
 
@@ -132,17 +187,23 @@ sittingRouter.get('/status', async (req, res) => {
 
     const allSessions: SittingSession[] = recentSessions || [];
 
-    // Calculate active duration
+    // Calculate active duration and its live relax/attentive split
     let activeDurationSeconds = 0;
     if (activeSession) {
       const activeStart = new Date(activeSession.started_at);
       activeDurationSeconds = Math.max(0, Math.floor((now.getTime() - activeStart.getTime()) / 1000));
     }
+    // Full-window overlap ⇒ share = 1 ⇒ exact totals including the running stretch
+    const activePosture = activeSession
+      ? postureShareSeconds(activeSession, activeDurationSeconds, now)
+      : { relax: 0, attentive: 0 };
 
     // 3. Process Today's metrics in the user's local timezone (handling midnight crossing)
     const todaySessions: SittingSession[] = [];
     let todayTotalSeconds = 0;
     let todayLongestSessionSeconds = 0;
+    let todayRelaxSeconds = 0;
+    let todayAttentiveSeconds = 0;
 
     for (const session of allSessions) {
       // Calculate overlap with today's local interval [todayStartUtc, now]
@@ -157,6 +218,10 @@ sittingRouter.get('/status', async (req, res) => {
         todaySessions.push(session);
         todayTotalSeconds += overlapSeconds;
 
+        const postureSplit = postureShareSeconds(session, overlapSeconds, now);
+        todayRelaxSeconds += postureSplit.relax;
+        todayAttentiveSeconds += postureSplit.attentive;
+
         // Compare effective duration for today
         if (overlapSeconds > todayLongestSessionSeconds) {
           todayLongestSessionSeconds = overlapSeconds;
@@ -168,6 +233,8 @@ sittingRouter.get('/status', async (req, res) => {
     const weeklyStats: DayStats[] = weeklyIntervals.map((interval) => {
       let dayTotal = 0;
       let dayCount = 0;
+      let dayRelax = 0;
+      let dayAttentive = 0;
 
       for (const session of allSessions) {
         const overlap = calculateSessionOverlapWithInterval(
@@ -180,6 +247,10 @@ sittingRouter.get('/status', async (req, res) => {
         if (overlap > 0) {
           dayTotal += overlap;
           dayCount++;
+
+          const postureSplit = postureShareSeconds(session, overlap, now);
+          dayRelax += postureSplit.relax;
+          dayAttentive += postureSplit.attentive;
         }
       }
 
@@ -188,16 +259,27 @@ sittingRouter.get('/status', async (req, res) => {
         dayName: interval.dayName,
         totalSeconds: dayTotal,
         sessionCount: dayCount,
+        relaxSeconds: dayRelax,
+        attentiveSeconds: dayAttentive,
+        unclassifiedSeconds: Math.max(0, dayTotal - dayRelax - dayAttentive),
       };
     });
 
     const latestSensor = getLatestSensorReading();
 
     const responsePayload: DashboardStatsResponse = {
-      status: activeSession ? 'SITTING' : 'AWAY',
+      status: activeSession
+        ? activeSession.posture_state === 'relaxing'
+          ? 'RELAXING'
+          : 'ATTENTIVE'
+        : 'AWAY',
       activeSession: activeSession || null,
       activeDurationSeconds,
+      activeRelaxSeconds: activePosture.relax,
+      activeAttentiveSeconds: activePosture.attentive,
       todayTotalSeconds,
+      todayRelaxSeconds,
+      todayAttentiveSeconds,
       todaySessionCount: todaySessions.length,
       todayLongestSessionSeconds,
       todaySessions,
@@ -241,10 +323,29 @@ sittingRouter.post('/simulate', async (req, res) => {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const action = body.action;
 
-    if (action !== 'start' && action !== 'stop') {
+    if (action !== 'start' && action !== 'stop' && action !== 'relax' && action !== 'focus') {
       return res.status(400).json({
         success: false,
-        error: 'Invalid action. Expected "start" or "stop"',
+        error: 'Invalid action. Expected "start", "stop", "relax" or "focus"',
+      });
+    }
+
+    // Posture actions: set the active session's posture (opens one if vacant)
+    if (action === 'relax' || action === 'focus') {
+      const result = await setPosture(action === 'relax' ? 'relaxing' : 'attentive');
+
+      if (result.status === 'db_error') {
+        return res.status(500).json({ success: false, error: result.error });
+      }
+
+      return res.json({
+        success: true,
+        status: result.status,
+        message:
+          result.status === 'updated'
+            ? `Posture set to ${action === 'relax' ? 'relaxing' : 'attentive'}.`
+            : 'Posture unchanged.',
+        session: result.session ?? null,
       });
     }
 

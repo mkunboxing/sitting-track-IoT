@@ -59,6 +59,11 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
           const percent = hasData
             ? Math.min(100, Math.max(6, Math.round((day.totalSeconds / maxSeconds) * 100)))
             : 0;
+          // Posture segments as a share of the bar (stacked bottom → top:
+          // attentive, relaxing, unclassified pre-posture time)
+          const segShare = (sec: number) =>
+            day.totalSeconds > 0 ? Math.min(100, (sec / day.totalSeconds) * 100) : 0;
+          const hasPostureData = day.relaxSeconds > 0 || day.attentiveSeconds > 0;
 
           return (
             <div key={day.date} className="flex-1 flex flex-col items-center gap-1.5 group h-full">
@@ -73,24 +78,46 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
               <div className="flex-1 w-full flex flex-col justify-end relative">
                 {/* Tooltip */}
                 <div className="absolute -top-12 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none z-30 whitespace-nowrap bg-zinc-950 border border-zinc-700 px-2 py-1 rounded-lg shadow-xl text-[11px] font-mono">
-                  <p className="font-semibold text-white">{day.dayName} {day.date.slice(5)}</p>
-                  <p className="text-emerald-400">{formatFriendlyDuration(day.totalSeconds)}</p>
+                  <p className="font-semibold text-white">{day.dayName} {day.date.slice(5)} · {formatFriendlyDuration(day.totalSeconds)}</p>
+                  {hasPostureData && (
+                    <>
+                      <p className="text-emerald-400">A {formatFriendlyDuration(day.attentiveSeconds)}</p>
+                      <p className="text-sky-400">R {formatFriendlyDuration(day.relaxSeconds)}</p>
+                    </>
+                  )}
+                  {day.unclassifiedSeconds > 0 && (
+                    <p className="text-zinc-400">Untracked {formatFriendlyDuration(day.unclassifiedSeconds)}</p>
+                  )}
                   <p className="text-zinc-400">{day.sessionCount} sess</p>
                 </div>
 
                 {/* Empty track */}
                 <div className="absolute inset-0 rounded-lg bg-zinc-800/40 border border-zinc-800/60 group-hover:border-zinc-700 transition-colors" />
 
-                {/* Filled portion */}
+                {/* Filled portion — stacked posture segments */}
                 {hasData && (
                   <div
-                    className={`relative w-full rounded-lg transition-all duration-700 overflow-hidden ${
-                      isToday
-                        ? 'bg-gradient-to-t from-emerald-700 to-teal-400 shadow-md shadow-emerald-500/20'
-                        : 'bg-gradient-to-t from-zinc-700 to-emerald-500/70 group-hover:to-teal-400'
-                    }`}
+                    className="relative w-full flex flex-col justify-end rounded-lg transition-all duration-700 overflow-hidden"
                     style={{ height: `${percent}%` }}
                   >
+                    {day.attentiveSeconds > 0 && (
+                      <div
+                        className={`w-full ${isToday ? 'bg-gradient-to-t from-emerald-600 to-teal-400' : 'bg-emerald-500/80'}`}
+                        style={{ height: `${segShare(day.attentiveSeconds)}%` }}
+                      />
+                    )}
+                    {day.relaxSeconds > 0 && (
+                      <div
+                        className={`w-full ${isToday ? 'bg-gradient-to-t from-sky-600 to-sky-400' : 'bg-sky-500/80'}`}
+                        style={{ height: `${segShare(day.relaxSeconds)}%` }}
+                      />
+                    )}
+                    {day.unclassifiedSeconds > 0 && (
+                      <div
+                        className="w-full bg-zinc-600/60"
+                        style={{ height: `${segShare(day.unclassifiedSeconds)}%` }}
+                      />
+                    )}
                     {isToday && (
                       <div className="absolute inset-0 bg-white/10 animate-pulse pointer-events-none" />
                     )}
@@ -121,6 +148,20 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
           <span>
             Best: <strong className="text-zinc-200">{bestDay?.dayName || 'N/A'}</strong>{' '}
             ({formatFriendlyDuration(bestDay?.totalSeconds || 0)})
+          </span>
+        </div>
+        <div className="flex items-center gap-3 text-[10px] font-medium">
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-sm bg-emerald-500/80 shrink-0" />
+            Attentive
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-sm bg-sky-500/80 shrink-0" />
+            Relaxing
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="w-2 h-2 rounded-sm bg-zinc-600/60 shrink-0" />
+            Pre-posture
           </span>
         </div>
         <div className="flex items-center gap-1.5">

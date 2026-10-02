@@ -9,11 +9,22 @@ create table if not exists public.sitting_sessions (
   ended_at timestamptz,
   duration_seconds bigint,
   last_heartbeat_at timestamptz default now(),
+  posture_state text,
+  posture_changed_at timestamptz,
+  relax_seconds bigint not null default 0,
+  attentive_seconds bigint not null default 0,
   created_at timestamptz not null default now()
 );
 
--- Migration safety: Add column if existing table was already created
+-- Migration safety: Add columns if existing table was already created
 alter table public.sitting_sessions add column if not exists last_heartbeat_at timestamptz default now();
+
+-- Posture tracking: per-session relaxing/attentive time split
+alter table public.sitting_sessions
+  add column if not exists posture_state text,
+  add column if not exists posture_changed_at timestamptz,
+  add column if not exists relax_seconds bigint not null default 0,
+  add column if not exists attentive_seconds bigint not null default 0;
 
 -- 2. Partial unique index: Guarantee that at most ONE session can be active (ended_at IS NULL)
 -- This enforces at the database level that multiple active sessions cannot be created concurrently.

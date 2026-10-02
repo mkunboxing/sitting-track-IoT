@@ -85,16 +85,18 @@ export default function DashboardPage() {
 
       const currentStatus = json.status;
       const prevStatus = previousStatusRef.current;
+      const isOccupiedStatus = (s: string | null) => s === 'RELAXING' || s === 'ATTENTIVE';
 
-      // Detect status transitions
+      // Detect status transitions (posture changes relaxing↔attentive do NOT
+      // re-trigger the session start/stop chimes)
       if (prevStatus !== null && prevStatus !== currentStatus) {
-        if (currentStatus === 'SITTING') {
+        if (isOccupiedStatus(currentStatus) && !isOccupiedStatus(prevStatus)) {
           // 1. Play sit-down sound (plays reliably in background tabs via HTMLAudioElement)
           soundManager.playSitDown();
 
           // 2. Fire system notification for session start
           notificationManager.notify('🪑 Sitting Session Started', {
-            body: 'Ultrasonic desk sensor detected you sitting down. Tracking has begun!',
+            body: `Ultrasonic desk sensor detected you at the desk (${currentStatus === 'RELAXING' ? 'relaxing' : 'attentive'}). Tracking has begun!`,
             tag: 'sitting-status-change',
           });
 
@@ -102,7 +104,7 @@ export default function DashboardPage() {
           setBreakAlertDismissed(false);
           breakAlarmPlayedRef.current = false;
 
-        } else if (currentStatus === 'AWAY') {
+        } else if (!isOccupiedStatus(currentStatus) && isOccupiedStatus(prevStatus)) {
           // 1. Play stand-up sound
           soundManager.playStandUp();
 
@@ -216,6 +218,12 @@ export default function DashboardPage() {
               setDistanceCm(typeof payload.distanceCm === 'number' ? payload.distanceCm : null);
               return;
             }
+            if (payload.type === 'POSTURE_CHANGE') {
+              // Posture shifted (relaxing ↔ attentive) — refresh metrics and
+              // timers instantly, without session start/stop chimes
+              fetchStatus(true);
+              return;
+            }
             if (payload.type === 'STATUS_CHANGE') {
               console.log('[Real-Time Telemetry] Instant event received from NodeMCU:', payload.action);
               // Trigger instant data refresh, audio chime, and notification (< 20ms)
@@ -270,6 +278,7 @@ export default function DashboardPage() {
   // Worker because background tabs throttle normal 1s timers to 1/minute.
   // (activeSession is non-null exactly when the backend reports SITTING.)
   const activeSession = data?.activeSession ?? null;
+  const titleStatusLabel = data?.status === 'RELAXING' ? 'Relaxing' : 'Sitting';
   useEffect(() => {
     const baseTitle = 'Sitting Time Tracker';
 
@@ -282,7 +291,7 @@ export default function DashboardPage() {
     const tick = () => {
       const s = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
       const pad = (n: number) => String(n).padStart(2, '0');
-      document.title = `⏱ ${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)} · Sitting`;
+      document.title = `⏱ ${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)} · ${titleStatusLabel}`;
     };
 
     tick();
@@ -291,13 +300,13 @@ export default function DashboardPage() {
       backgroundTimer.stop('title');
       document.title = baseTitle;
     };
-  }, [activeSession]);
+  }, [activeSession, titleStatusLabel]);
 
   // Break reminder watcher
   const activeDurationSec = data?.activeDurationSeconds ?? 0;
-  const isSitting = data?.status === 'SITTING';
+  const isOccupied = data?.status === 'RELAXING' || data?.status === 'ATTENTIVE';
   const breakLimitSec = breakIntervalMin * 60;
-  const shouldTriggerBreak = isSitting && breakIntervalMin > 0 && activeDurationSec >= breakLimitSec;
+  const shouldTriggerBreak = isOccupied && breakIntervalMin > 0 && activeDurationSec >= breakLimitSec;
 
   useEffect(() => {
     if (shouldTriggerBreak && !breakAlarmPlayedRef.current && !breakAlertDismissed) {
@@ -315,7 +324,7 @@ export default function DashboardPage() {
   }, [shouldTriggerBreak, breakAlertDismissed, breakIntervalMin]);
 
   // Simulator / manual action handler
-  const handleSimulate = async (action: 'start' | 'stop') => {
+  const handleSimulate = async (action: 'start' | 'stop' | 'relax' | 'focus') => {
     setSimulating(true);
     try {
       const res = await fetch(apiUrl('/api/sitting/simulate'), {
@@ -500,13 +509,16 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* 2. Key Metrics Grid (2 columns on mobile, 4 columns on desktop) */}
+        {/* 2. Key Metrics Grid (2 columns on mobile, 6 columns on desktop) */}
         <MetricsGrid
           todayTotalSeconds={data?.todayTotalSeconds ?? 0}
           activeDurationSeconds={data?.activeDurationSeconds ?? 0}
-          isSitting={isSitting}
+          isOccupied={isOccupied}
+          currentPosture={data?.status ?? 'AWAY'}
           todaySessionCount={data?.todaySessionCount ?? 0}
           todayLongestSessionSeconds={data?.todayLongestSessionSeconds ?? 0}
+          todayRelaxSeconds={data?.todayRelaxSeconds ?? 0}
+          todayAttentiveSeconds={data?.todayAttentiveSeconds ?? 0}
         />
 
         {/* 3. Analytics & Historical Logs (Chart + Scrollable Table) */}

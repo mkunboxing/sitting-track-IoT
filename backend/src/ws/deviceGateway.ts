@@ -2,7 +2,7 @@ import type { Server as HttpServer, IncomingMessage } from 'http';
 import { WebSocketServer, WebSocket } from 'ws';
 import {
   canUseDatabase,
-  openSession,
+  setPosture,
   closeActiveSession,
   touchActiveSessionHeartbeat,
 } from '../lib/sessionService';
@@ -25,7 +25,7 @@ import { eventBroadcaster } from '../lib/eventBroadcaster';
  * Protocol (JSON text frames):
  *   ESP → Backend:
  *     { "type": "authenticate", "deviceId": "...", "token": "..." }
- *     { "type": "state_change", "deviceId": "...", "state": "sitting" | "away" }
+ *     { "type": "state_change", "deviceId": "...", "state": "relaxing" | "attentive" | "vacant" }
  *     { "type": "sensor",       "deviceId": "...", "distance": 75.4 }
  *   Backend → ESP:
  *     { "type": "authenticated", "deviceId": "..." }
@@ -342,8 +342,13 @@ async function handleStateChange(conn: DeviceConnection, msg: Record<string, unk
   const state = msg.state;
   const deviceId = conn.deviceId as string;
 
-  if (state !== 'sitting' && state !== 'away') {
-    sendJson(conn.ws, { type: 'error', message: 'state must be "sitting" or "away"' });
+  // 'sitting'/'away' are legacy values from pre-posture firmware; they map to
+  // attentive/vacant so old devices keep working across the rollout.
+  const postureStates = ['relaxing', 'attentive', 'sitting'];
+  const vacantStates = ['vacant', 'away'];
+
+  if (typeof state !== 'string' || (!postureStates.includes(state) && !vacantStates.includes(state))) {
+    sendJson(conn.ws, { type: 'error', message: 'state must be "relaxing", "attentive" or "vacant"' });
     return;
   }
 
@@ -352,42 +357,43 @@ async function handleStateChange(conn: DeviceConnection, msg: Record<string, unk
     return;
   }
 
-  if (state === 'sitting') {
-    const result = await openSession();
+  if (postureStates.includes(state)) {
+    const posture = state === 'relaxing' ? 'relaxing' : 'attentive';
+    const result = await setPosture(posture);
     switch (result.status) {
-      case 'started':
-        console.log(`[WS] State change: sitting (${deviceId}) — session ${result.session.id} started`);
-        sendJson(conn.ws, { type: 'ack', state: 'sitting', result: 'started', sessionId: result.session.id });
+      case 'updated':
+        console.log(`[WS] State change: ${state} (${deviceId}) — session ${result.session.id} posture set to ${posture}`);
+        sendJson(conn.ws, { type: 'ack', state, result: 'updated', sessionId: result.session.id });
         break;
-      case 'already_active':
-        // Duplicate state_change / device reconnect while sitting — safe no-op
-        console.log(`[WS] State change: sitting (${deviceId}) — session already active, no duplicate created`);
+      case 'unchanged':
+        // Duplicate posture state — safe no-op
+        console.log(`[WS] State change: ${state} (${deviceId}) — no posture change needed`);
         sendJson(conn.ws, {
           type: 'ack',
-          state: 'sitting',
-          result: 'already_active',
+          state,
+          result: 'unchanged',
           sessionId: result.session?.id ?? null,
         });
         break;
       case 'db_error':
-        console.error(`[WS] Failed to open session for ${deviceId}:`, result.error);
-        sendJson(conn.ws, { type: 'error', message: 'Failed to open session' });
+        console.error(`[WS] Failed to set posture for ${deviceId}:`, result.error);
+        sendJson(conn.ws, { type: 'error', message: 'Failed to set posture' });
         break;
     }
     return;
   }
 
-  // state === 'away'
+  // state === 'vacant' | 'away'
   const result = await closeActiveSession();
   switch (result.status) {
     case 'stopped':
-      console.log(`[WS] State change: away (${deviceId}) — session closed, duration ${result.durationSeconds}s`);
-      sendJson(conn.ws, { type: 'ack', state: 'away', result: 'closed', durationSeconds: result.durationSeconds });
+      console.log(`[WS] State change: ${state} (${deviceId}) — session closed, duration ${result.durationSeconds}s`);
+      sendJson(conn.ws, { type: 'ack', state, result: 'closed', durationSeconds: result.durationSeconds });
       break;
     case 'no_active_session':
-      // Duplicate away / away after disconnect-close — safe no-op
-      console.log(`[WS] State change: away (${deviceId}) — no active session, nothing to close`);
-      sendJson(conn.ws, { type: 'ack', state: 'away', result: 'no_active_session' });
+      // Duplicate vacant / vacant after disconnect-close — safe no-op
+      console.log(`[WS] State change: ${state} (${deviceId}) — no active session, nothing to close`);
+      sendJson(conn.ws, { type: 'ack', state, result: 'no_active_session' });
       break;
     case 'db_error':
       console.error(`[WS] Failed to close session for ${deviceId}:`, result.error);
