@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { getSupabaseServerClient, isSupabaseConfigured } from '../lib/supabase';
 import { requireDeviceToken } from '../lib/auth';
 import { eventBroadcaster } from '../lib/eventBroadcaster';
+import { openSession, closeActiveSession } from '../lib/sessionService';
 import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '../lib/timeUtils';
 import type { DashboardStatsResponse, DayStats, SittingSession } from '../types/sitting';
 
@@ -217,7 +218,7 @@ sittingRouter.post('/simulate', async (req, res) => {
   if (!isSupabaseConfigured()) {
     return res.status(503).json({
       success: false,
-      error: 'Database not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in server/.env',
+      error: 'Database not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY in backend/.env',
     });
   }
 
@@ -232,57 +233,38 @@ sittingRouter.post('/simulate', async (req, res) => {
       });
     }
 
-    const supabase = getSupabaseServerClient();
-
     if (action === 'start') {
-      // Check if session already active
-      const { data: existingActive } = await supabase
-        .from('sitting_sessions')
-        .select('*')
-        .is('ended_at', null)
-        .order('started_at', { ascending: false })
-        .limit(1)
-        .maybeSingle();
+      const result = await openSession();
 
-      if (existingActive) {
+      if (result.status === 'db_error') {
+        return res.status(500).json({ success: false, error: result.error });
+      }
+
+      if (result.status === 'already_active') {
         return res.json({
           success: true,
           status: 'already_active',
           message: 'A session is already active.',
-          session: existingActive,
+          session: result.session,
         });
       }
-
-      const { data: newSession, error } = await supabase
-        .from('sitting_sessions')
-        .insert([{ started_at: new Date().toISOString() }])
-        .select()
-        .single();
-
-      if (error) {
-        return res.status(500).json({ success: false, error: error.message });
-      }
-
-      eventBroadcaster.broadcast('start', { session: newSession });
 
       return res.json({
         success: true,
         status: 'started',
         message: 'Simulated sitting session started.',
-        session: newSession,
+        session: result.session,
       });
     }
 
     // action === 'stop'
-    const { data: activeSession } = await supabase
-      .from('sitting_sessions')
-      .select('*')
-      .is('ended_at', null)
-      .order('started_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    const result = await closeActiveSession();
 
-    if (!activeSession) {
+    if (result.status === 'db_error') {
+      return res.status(500).json({ success: false, error: result.error });
+    }
+
+    if (result.status === 'no_active_session') {
       return res.json({
         success: true,
         status: 'no_active_session',
@@ -290,31 +272,11 @@ sittingRouter.post('/simulate', async (req, res) => {
       });
     }
 
-    const now = new Date();
-    const start = new Date(activeSession.started_at);
-    const durationSeconds = Math.max(0, Math.floor((now.getTime() - start.getTime()) / 1000));
-
-    const { data: updatedSession, error } = await supabase
-      .from('sitting_sessions')
-      .update({
-        ended_at: now.toISOString(),
-        duration_seconds: durationSeconds,
-      })
-      .eq('id', activeSession.id)
-      .select()
-      .single();
-
-    if (error) {
-      return res.status(500).json({ success: false, error: error.message });
-    }
-
-    eventBroadcaster.broadcast('stop', { session: updatedSession, durationSeconds });
-
     return res.json({
       success: true,
       status: 'stopped',
       message: 'Simulated sitting session ended.',
-      session: updatedSession,
+      session: result.session,
     });
   } catch (err: unknown) {
     return res.status(500).json({
@@ -336,85 +298,37 @@ sittingRouter.post('/start', requireDeviceToken, async (req, res) => {
     });
   }
 
-  const supabase = getSupabaseServerClient();
+  // 2. Session lifecycle is handled by the shared service (also used by the
+  //    WebSocket gateway) — identical duplicate/race handling as before.
+  const result = await openSession();
 
-  try {
-    // 2. Check for existing active session (ended_at IS NULL)
-    const { data: existingActive, error: fetchError } = await supabase
-      .from('sitting_sessions')
-      .select('*')
-      .is('ended_at', null)
-      .order('started_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+  switch (result.status) {
+    case 'db_error':
+      console.error('[API /sitting/start] Query/insert error:', result.error);
+      return res.status(500).json({ success: false, error: result.error });
 
-    if (fetchError) {
-      console.error('[API /sitting/start] Query error:', fetchError);
-      return res.status(500).json({ success: false, error: fetchError.message });
-    }
-
-    // 3. Edge Case Handling: Duplicate START or NodeMCU restarted while sitting
-    if (existingActive) {
-      console.log(`[API /sitting/start] Active session already exists: ${existingActive.id}. Returning existing session.`);
+    case 'already_active': {
+      const message =
+        result.reason === 'race'
+          ? 'An active session was concurrently created.'
+          : 'An active session is already in progress.';
+      console.log(`[API /sitting/start] ${message} Returning existing session.`);
       return res.status(200).json({
         success: true,
         status: 'already_active',
-        message: 'An active session is already in progress.',
-        session: existingActive,
+        message,
+        session: result.session,
       });
     }
 
-    // 4. Create new session with current server timestamp
-    const nowIso = new Date().toISOString();
-    const { data: newSession, error: insertError } = await supabase
-      .from('sitting_sessions')
-      .insert([
-        {
-          started_at: nowIso,
-          ended_at: null,
-          duration_seconds: null,
-        },
-      ])
-      .select()
-      .single();
-
-    if (insertError) {
-      // If a race condition triggered the unique index constraint (23505)
-      if (insertError.code === '23505') {
-        const { data: fallbackActive } = await supabase
-          .from('sitting_sessions')
-          .select('*')
-          .is('ended_at', null)
-          .order('started_at', { ascending: false })
-          .limit(1)
-          .single();
-
-        return res.status(200).json({
-          success: true,
-          status: 'already_active',
-          message: 'An active session was concurrently created.',
-          session: fallbackActive,
-        });
-      }
-
-      console.error('[API /sitting/start] Insert error:', insertError);
-      return res.status(500).json({ success: false, error: insertError.message });
-    }
-
-    console.log(`[API /sitting/start] Started session ${newSession.id} at ${newSession.started_at}`);
-
-    // Broadcast change immediately to all open dashboard tabs (< 20ms)
-    eventBroadcaster.broadcast('start', { session: newSession });
-
-    return res.status(201).json({
-      success: true,
-      status: 'started',
-      message: 'Sitting session started successfully.',
-      session: newSession,
-    });
-  } catch (err: unknown) {
-    console.error('[API /sitting/start] Unexpected error:', err);
-    return res.status(500).json({ success: false, error: 'Internal server error' });
+    case 'started':
+      console.log(`[API /sitting/start] Started session ${result.session.id} at ${result.session.started_at}`);
+      return res.status(201).json({
+        success: true,
+        status: 'started',
+        message: 'Sitting session started successfully.',
+        session: result.session,
+      });
   }
 });
 
@@ -430,72 +344,33 @@ sittingRouter.post('/stop', requireDeviceToken, async (req, res) => {
     });
   }
 
-  const supabase = getSupabaseServerClient();
+  // 2. Session lifecycle is handled by the shared service (also used by the
+  //    WebSocket gateway) — identical idempotent behavior as before.
+  const result = await closeActiveSession();
 
-  try {
-    // 2. Find the currently active session (ended_at IS NULL)
-    const { data: activeSession, error: fetchError } = await supabase
-      .from('sitting_sessions')
-      .select('*')
-      .is('ended_at', null)
-      .order('started_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+  switch (result.status) {
+    case 'db_error':
+      console.error('[API /sitting/stop] Query/update error:', result.error);
+      return res.status(500).json({ success: false, error: result.error });
 
-    if (fetchError) {
-      console.error('[API /sitting/stop] Query error:', fetchError);
-      return res.status(500).json({ success: false, error: fetchError.message });
-    }
-
-    // 3. Edge Case Handling: Duplicate STOP or STOP received without an active session
-    if (!activeSession) {
+    case 'no_active_session':
       console.log('[API /sitting/stop] No active session found. Ignoring duplicate stop.');
       return res.status(200).json({
         success: true,
         status: 'no_active_session',
         message: 'No active session was in progress. Nothing to stop.',
       });
-    }
 
-    // 4. Server is the source of truth for timestamps:
-    const stopTime = new Date();
-    const startTime = new Date(activeSession.started_at);
-    const durationSeconds = Math.max(
-      0,
-      Math.floor((stopTime.getTime() - startTime.getTime()) / 1000)
-    );
-
-    const { data: updatedSession, error: updateError } = await supabase
-      .from('sitting_sessions')
-      .update({
-        ended_at: stopTime.toISOString(),
-        duration_seconds: durationSeconds,
-      })
-      .eq('id', activeSession.id)
-      .select()
-      .single();
-
-    if (updateError) {
-      console.error('[API /sitting/stop] Update error:', updateError);
-      return res.status(500).json({ success: false, error: updateError.message });
-    }
-
-    console.log(
-      `[API /sitting/stop] Stopped session ${updatedSession.id}. Duration: ${durationSeconds} seconds.`
-    );
-
-    // Broadcast change immediately to all open dashboard tabs (< 20ms)
-    eventBroadcaster.broadcast('stop', { session: updatedSession, durationSeconds });
-
-    return res.status(200).json({
-      success: true,
-      status: 'stopped',
-      message: 'Sitting session stopped successfully.',
-      session: updatedSession,
-    });
-  } catch (err: unknown) {
-    console.error('[API /sitting/stop] Unexpected error:', err);
-    return res.status(500).json({ success: false, error: 'Internal server error' });
+    case 'stopped':
+      console.log(
+        `[API /sitting/stop] Stopped session ${result.session.id}. Duration: ${result.durationSeconds} seconds.`
+      );
+      return res.status(200).json({
+        success: true,
+        status: 'stopped',
+        message: 'Sitting session stopped successfully.',
+        session: result.session,
+      });
   }
 });
 

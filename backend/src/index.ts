@@ -1,8 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import type { Server } from 'http';
 import { sittingRouter } from './routes/sitting';
 import { eventBroadcaster } from './lib/eventBroadcaster';
+import { attachDeviceGateway, getOnlineDeviceIds } from './ws/deviceGateway';
 
 const app = express();
 
@@ -26,7 +28,7 @@ app.use('/api/sitting', sittingRouter);
 
 // Health check
 app.get('/health', (_req, res) => {
-  res.json({ success: true, sseClients: eventBroadcaster.getClientCount() });
+  res.json({ success: true, sseClients: eventBroadcaster.getClientCount(), onlineDevices: getOnlineDeviceIds() });
 });
 
 // JSON body parse errors and unexpected errors
@@ -47,7 +49,11 @@ app.use(
 );
 
 const port = parseInt(process.env.PORT || '4000', 10);
-app.listen(port, () => {
+const server: Server = app.listen(port, () => {
   console.log(`[SERVER] Smart Tracking API listening on http://localhost:${port}`);
   console.log(`[SERVER] CORS origins: ${allowedOrigins.join(', ')}`);
 });
+
+// Persistent WebSocket gateway for the ESP8266 device — shares the HTTP port.
+// Devices connect to: ws://<host>:<port>/ws/device
+attachDeviceGateway(server);
