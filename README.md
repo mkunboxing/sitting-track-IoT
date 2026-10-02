@@ -76,7 +76,7 @@ The ESP8266 talks to the backend over a **persistent WebSocket** (library: `WebS
 | Backend → ESP | `{"type":"auth_error","error":"…"}` + close 4001 | Bad token / timeout |
 | ESP → Backend | `{"type":"state_change","deviceId":"…","state":"sitting"\|"away"}` | Opens/closes a session (idempotent — duplicates are safe no-ops) |
 | Backend → ESP | `{"type":"ack","state":"…","result":"started\|closed\|already_active\|no_active_session","durationSeconds"?:n}` | Session result |
-| ESP → Backend | `{"type":"sensor","deviceId":"…","distance":75.4}` | Optional telemetry, logged only (firmware does not send it by default) |
+| ESP → Backend | `{"type":"sensor","deviceId":"…","distance":75.4}` | Live distance telemetry, sent every 5 s; cached in memory and pushed to dashboards via SSE (never stored in the DB). `-1` = out of range |
 
 ### Liveness, disconnects & reconnects
 
@@ -84,6 +84,7 @@ The ESP8266 talks to the backend over a **persistent WebSocket** (library: `WebS
 - **Unexpected disconnect** (Wi-Fi loss, power-off, platform-forced drop): the session is **not** closed instantly — managed platforms like Cloud Run force-close long-lived WebSocket connections periodically, and closing on every drop would fragment sessions. Instead the session is left active and auto-closed by the `/status` stale-check (~90 s, `ended_at` = last-contact time) **only if the device does not return**. A device that reconnects quickly and syncs `sitting` continues the same session (`already_active`) with no fragmentation.
 - **Reconnect:** the ESP reconnects every 5s (no rapid loops), re-authenticates, then sends only its **current** state. Backend handling is idempotent, so normal reconnects never create duplicate sessions: `sitting` with an active session → no-op; `away` without one → no-op.
 - **State change while offline:** nothing is queued or replayed — the ESP holds its current state locally and sends it once after the next successful authentication (never a stale event).
+- **Live distance:** the device sends its latest HC-SR04 reading every 5 s; the backend pushes it to all dashboard tabs as a `{"type":"DISTANCE",…}` SSE event (no status refetch needed) and includes it in `/status` responses as `distanceCm`. In-memory only — nothing is persisted.
 - **One connection per deviceId:** a newer authenticated connection silently replaces the older one (close code 4000) without touching sessions.
 - Backend close codes: `4001` authentication failed/timeout/not authenticated · `4000` connection replaced.
 
@@ -317,6 +318,7 @@ node scripts/ws-device-simulator.mjs away       # close the session (prints dura
 node scripts/ws-device-simulator.mjs crash      # sit, then hard-drop → session auto-closes via stale-check (~90s)
 node scripts/ws-device-simulator.mjs reconnect  # sit → drop → reconnect → sync → away
 node scripts/ws-device-simulator.mjs badtoken   # expect auth_error + close 4001
+node scripts/ws-device-simulator.mjs sensor     # stream live distance readings (watch dashboard/SSE)
 node scripts/ws-device-simulator.mjs malformed  # garbage frames → error replies, server alive
 node scripts/ws-device-simulator.mjs twice      # second connection with same deviceId supersedes first
 ```

@@ -26,6 +26,9 @@ export interface DashboardStatsResponse {
   weeklyStats: DayStats[];
   lastUpdated: string;
   configured: boolean;
+  /** Latest ultrasonic reading from the device (in-memory, not persisted) */
+  distanceCm?: number | null;
+  distanceUpdatedAt?: string | null;
 }
 
 export interface ApiResponse<T = unknown> {

@@ -72,6 +72,16 @@ class EventBroadcaster {
     this.sendRaw(message);
   }
 
+  /**
+   * Push a lightweight custom event (e.g. live distance telemetry) to all
+   * dashboard tabs WITHOUT triggering a status refetch — the payload carries
+   * everything the client needs.
+   */
+  public broadcastEvent(type: string, payload?: Record<string, unknown>): void {
+    const data = JSON.stringify({ type, timestamp: Date.now(), ...payload });
+    this.sendRaw(`event: message\ndata: ${data}\n\n`);
+  }
+
   private write(res: ClientResponse, text: string): void {
     try {
       res.write(text);

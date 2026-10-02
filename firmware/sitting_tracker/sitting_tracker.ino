@@ -78,9 +78,7 @@ const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
 //   wss://sitting-track-iot-1014206902177.asia-south2.run.app/ws/device
 //     WS_HOST = "sitting-track-iot-1014206902177.asia-south2.run.app"
 //     WS_PORT = 443, USE_TLS = true
-//     WS_CA_CERT: paste the "GTS Root R1" PEM from https://pki.goog
-//     (with WS_CA_CERT empty it connects with unvalidated TLS — works, but
-//      no server-identity checking; paste the root cert for production)
+//     WS_CA_CERT = GTS Root R1 (already embedded below — full validation)
 //
 // Local development (backend running on your computer — use your LAN IP):
 //   ws://192.168.1.12:4000/ws/device      → USE_TLS = false
@@ -91,11 +89,43 @@ const uint16_t WS_PORT    = 443;              // 443 for Cloud Run (wss), 4000 f
 const char*    WS_PATH    = "/ws/device";
 const bool     USE_TLS    = true;             // true → wss:// (Cloud Run); false → local dev
 
-// Root CA for production wss:// (no setInsecure()!).
-// Cloud Run (*.run.app): paste the "GTS Root R1" PEM from https://pki.goog.
-// NTP time sync runs in setup() — BearSSL needs a valid clock to check the
-// certificate's validity dates.
-const char* WS_CA_CERT = "";
+// Root CA for production wss:// — GTS Root R1 (Google Trust Services), the
+// trust anchor for *.run.app certificates. Self-signed, valid 2016–2036.
+// BearSSL validates the full chain (leaf → WR2 → this root) + hostname, so
+// no setInsecure() is used anywhere. NTP time sync runs in setup() because
+// certificate validity checks need a correct clock.
+const char* WS_CA_CERT =
+  "-----BEGIN CERTIFICATE-----\n"
+  "MIIFWjCCA0KgAwIBAgIQbkepxUtHDA3sM9CJuRz04TANBgkqhkiG9w0BAQwFADBH\n"
+  "MQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExM\n"
+  "QzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIy\n"
+  "MDAwMDAwWjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNl\n"
+  "cnZpY2VzIExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjEwggIiMA0GCSqGSIb3DQEB\n"
+  "AQUAA4ICDwAwggIKAoICAQC2EQKLHuOhd5s73L+UPreVp0A8of2C+X0yBoJx9vaM\n"
+  "f/vo27xqLpeXo4xL+Sv2sfnOhB2x+cWX3u+58qPpvBKJXqeqUqv4IyfLpLGcY9vX\n"
+  "mX7wCl7raKb0xlpHDU0QM+NOsROjyBhsS+z8CZDfnWQpJSMHobTSPS5g4M/SCYe7\n"
+  "zUjwTcLCeoiKu7rPWRnWr4+wB7CeMfGCwcDfLqZtbBkOtdh+JhpFAz2weaSUKK0P\n"
+  "fyblqAj+lug8aJRT7oM6iCsVlgmy4HqMLnXWnOunVmSPlk9orj2XwoSPwLxAwAtc\n"
+  "vfaHszVsrBhQf4TgTM2S0yDpM7xSma8ytSmzJSq0SPly4cpk9+aCEI3oncKKiPo4\n"
+  "Zor8Y/kB+Xj9e1x3+naH+uzfsQ55lVe0vSbv1gHR6xYKu44LtcXFilWr06zqkUsp\n"
+  "zBmkMiVOKvFlRNACzqrOSbTqn3yDsEB750Orp2yjj32JgfpMpf/VjsPOS+C12LOO\n"
+  "Rc92wO1AK/1TD7Cn1TsNsYqiA94xrcx36m97PtbfkSIS5r762DL8EGMUUXLeXdYW\n"
+  "k70paDPvOmbsB4om3xPXV2V4J95eSRQAogB/mqghtqmxlbCluQ0WEdrHbEg8QOB+\n"
+  "DVrNVjzRlwW5y0vtOUucxD/SVRNuJLDWcfr0wbrM7Rv1/oFB2ACYPTrIrnqYNxgF\n"
+  "lQIDAQABo0IwQDAOBgNVHQ8BAf8EBAMCAQYwDwYDVR0TAQH/BAUwAwEB/zAdBgNV\n"
+  "HQ4EFgQU5K8rJnEaK0gnhS9SZizv8IkTcT4wDQYJKoZIhvcNAQEMBQADggIBADiW\n"
+  "Cu49tJYeX++dnAsznyvgyv3SjgofQXSlfKqE1OXyHuY3UjKcC9FhHb8owbZEKTV1\n"
+  "d5iyfNm9dKyKaOOpMQkpAWBz40d8U6iQSifvS9efk+eCNs6aaAyC58/UEBZvXw6Z\n"
+  "XPYfcX3v73svfuo21pdwCxXu11xWajOl40k4DLh9+42FpLFZXvRq4d2h9mREruZR\n"
+  "gyFmxhE+885H7pwoHyXa/6xmld01D1zvICxi/ZG6qcz8WpyTgYMpl0p8WnK0OdC3\n"
+  "d8t5/Wk6kjftbjhlRn7pYL15iJdfOBL07q9bgsiG1eGZbYwE8na6SfZu6W0eX6Dv\n"
+  "J4J2QPim01hcDyxC2kLGe4g0x8HYRZvBPsVhHdljUEn2NIVq4BjFbkerQUIpm/Zg\n"
+  "DdIx02OYI5NaAIFItO/Nis3Jz5nu2Z6qNuFoS3FJFDYoOj0dzpqPJeaAcWErtXvM\n"
+  "+SUWgeExX6GjfhaknBZqlxi9dnKlC54dNuYvoS++cJEPqOba+MSSQGwlfnuzCdyy\n"
+  "F62ARPBopY+Udf90WuioAnwMCeKpSwughQtiue+hMZL77/ZRBIls6Kl0obsXs7X9\n"
+  "SQ98POyDGCBDTtWTurQ0sR8WNh8M5mQ5Fkzc4P4dyKliPUDqysU0ArSuiYgzNdws\n"
+  "E3PYJ/HQcu51OyLemGhmW/HGY0dVHLqlCFF1pkgl\n"
+  "-----END CERTIFICATE-----\n";
 
 // This device's identity (reported to the backend; one live connection per ID)
 const char* DEVICE_ID = "sitting-tracker-01";
@@ -118,6 +148,11 @@ const float SITTING_LIMIT_CM        = 120.0; // Distance <= 120 cm is sitting
 const unsigned long SITTING_CONFIRM = 2000;  // 2000 ms continuous detection to confirm sitting
 const unsigned long AWAY_CONFIRM    = 5000;  // 5000 ms continuous detection to confirm away
 const unsigned long SENSOR_INTERVAL = 700;   // 700 ms between sensor readings
+
+// Live distance telemetry: send the latest reading to the dashboard every 5s
+// over the WebSocket ({"type":"sensor",...}). The backend caches it in memory
+// and pushes it to the dashboard via SSE — it is never stored in the database.
+const unsigned long SENSOR_SEND_INTERVAL_MS = 5000;
 
 // WebSocket keepalive: protocol-level ping every 15s, pong must arrive within
 // 3s; 2 missed pongs ⇒ the library drops the TCP connection and reconnects.
@@ -152,6 +187,8 @@ bool wsAuthenticated = false; // true after the backend confirms authentication
 
 // Timer for sensor reading loop
 unsigned long lastSensorReadTime = 0;
+unsigned long lastSensorSendTime = 0;      // live telemetry pacing
+float lastMeasuredDistanceCm = -1.0;       // latest reading, sent as telemetry
 
 // ==============================================================================
 // 4. FUNCTION DECLARATIONS
@@ -159,6 +196,7 @@ unsigned long lastSensorReadTime = 0;
 
 float readDistanceCm();
 void sendStateChange(State newState);
+void sendSensorReading();
 void sendAuthenticate();
 void syncCurrentState();
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
@@ -259,6 +297,7 @@ void loop() {
     lastSensorReadTime = now;
 
     float distance = readDistanceCm();
+    lastMeasuredDistanceCm = distance; // remembered for the periodic telemetry message
 
     // Print reading to Serial Monitor
     Serial.print(F("[SENSOR] Dist: "));
@@ -300,6 +339,14 @@ void loop() {
     }
 
     Serial.println();
+  }
+
+  // 4. Periodic live distance telemetry (every SENSOR_SEND_INTERVAL_MS).
+  //    Tiny JSON frame on the already-open WebSocket; the backend pushes it
+  //    to dashboard tabs via SSE. Silently skipped while offline.
+  if (now - lastSensorSendTime >= SENSOR_SEND_INTERVAL_MS) {
+    lastSensorSendTime = now;
+    sendSensorReading();
   }
 
   // NOTE: No HTTP heartbeat anymore — WebSocket ping/pong (library heartbeat +
@@ -433,6 +480,20 @@ void sendStateChange(State newState) {
   } else {
     Serial.println(F("[WS] Send failed — state held locally, will sync after reconnect"));
   }
+}
+
+/**
+ * Send the latest distance reading as lightweight telemetry. Skipped silently
+ * while the WebSocket is down (the dashboard holds the last known value).
+ */
+void sendSensorReading() {
+  if (!webSocket.isConnected() || !wsAuthenticated) return;
+
+  char payload[96];
+  snprintf(payload, sizeof(payload),
+           "{\"type\":\"sensor\",\"deviceId\":\"%s\",\"distance\":%.1f}",
+           DEVICE_ID, lastMeasuredDistanceCm);
+  webSocket.sendTXT(payload);
 }
 
 /**

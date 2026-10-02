@@ -3,6 +3,7 @@ import { getSupabaseServerClient, isSupabaseConfigured } from '../lib/supabase';
 import { requireDeviceToken } from '../lib/auth';
 import { eventBroadcaster } from '../lib/eventBroadcaster';
 import { openSession, closeActiveSession } from '../lib/sessionService';
+import { getLatestSensorReading } from '../ws/deviceGateway';
 import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '../lib/timeUtils';
 import type { DashboardStatsResponse, DayStats, SittingSession } from '../types/sitting';
 
@@ -102,6 +103,14 @@ sittingRouter.get('/status', async (req, res) => {
           .eq('id', activeSession.id);
 
         console.log(`[API] Auto-closed abandoned session ${activeSession.id} because module was powered off.`);
+
+        // Push the close to every dashboard tab instantly (otherwise tabs
+        // would only learn about it from their next status poll).
+        eventBroadcaster.broadcast('stop', {
+          session: { ...activeSession, ended_at: autoEndTime, duration_seconds: closedDuration },
+          durationSeconds: closedDuration,
+        });
+
         activeSession = null;
       }
     }
@@ -180,6 +189,8 @@ sittingRouter.get('/status', async (req, res) => {
       };
     });
 
+    const latestSensor = getLatestSensorReading();
+
     const responsePayload: DashboardStatsResponse = {
       status: activeSession ? 'SITTING' : 'AWAY',
       activeSession: activeSession || null,
@@ -191,6 +202,8 @@ sittingRouter.get('/status', async (req, res) => {
       weeklyStats,
       lastUpdated: now.toISOString(),
       configured: true,
+      distanceCm: latestSensor?.distanceCm ?? null,
+      distanceUpdatedAt: latestSensor?.updatedAt ?? null,
     };
 
     return res.json(responsePayload);

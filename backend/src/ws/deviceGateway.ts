@@ -6,6 +6,7 @@ import {
   closeActiveSession,
   touchActiveSessionHeartbeat,
 } from '../lib/sessionService';
+import { eventBroadcaster } from '../lib/eventBroadcaster';
 
 /**
  * Device WebSocket Gateway
@@ -54,12 +55,28 @@ interface DeviceConnection {
 /** deviceId → current live connection. Single registry of connected devices. */
 const devices = new Map<string, DeviceConnection>();
 
+/** deviceId → latest sensor telemetry. In-memory only (never stored in the DB). */
+const latestSensorData = new Map<string, { distanceCm: number; updatedAt: string }>();
+
 export function getOnlineDeviceCount(): number {
   return devices.size;
 }
 
 export function getOnlineDeviceIds(): string[] {
   return Array.from(devices.keys());
+}
+
+/**
+ * Most recent sensor reading across devices (single-device system today).
+ * Used by /status so a freshly loaded dashboard shows the last known
+ * distance immediately, and by /health for debugging.
+ */
+export function getLatestSensorReading(): { distanceCm: number; updatedAt: string } | null {
+  let latest: { distanceCm: number; updatedAt: string } | null = null;
+  for (const reading of latestSensorData.values()) {
+    if (!latest || reading.updatedAt > latest.updatedAt) latest = reading;
+  }
+  return latest;
 }
 
 function sendJson(ws: WebSocket, payload: Record<string, unknown>): void {
@@ -243,11 +260,24 @@ function handleMessage(conn: DeviceConnection, msg: Record<string, unknown>): vo
     case 'state_change':
       handleStateChange(conn, msg);
       return;
-    case 'sensor':
-      // Optional telemetry — logged only, never stored. Firmware does not
-      // send this by default.
-      console.log(`[WS] Sensor reading from ${conn.deviceId}: distance=${String(msg.distance)}`);
+    case 'sensor': {
+      // Optional telemetry — firmware sends one reading every few seconds.
+      // Cached in memory and pushed to dashboards over SSE; never stored in
+      // the database.
+      const distance = Number(msg.distance);
+      if (!Number.isFinite(distance)) {
+        sendJson(conn.ws, { type: 'error', message: 'sensor.distance must be a number' });
+        return;
+      }
+      const reading = { distanceCm: distance, updatedAt: new Date().toISOString() };
+      latestSensorData.set(conn.deviceId, reading);
+      eventBroadcaster.broadcastEvent('DISTANCE', {
+        deviceId: conn.deviceId,
+        distanceCm: reading.distanceCm,
+        updatedAt: reading.updatedAt,
+      });
       return;
+    }
     default:
       sendJson(conn.ws, { type: 'error', message: `Unknown message type: ${String(type)}` });
   }

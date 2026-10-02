@@ -120,8 +120,8 @@ class Device {
 }
 
 async function main() {
-  if (!command || !['sit', 'away', 'crash', 'reconnect', 'badtoken', 'malformed', 'twice', 'ping'].includes(command)) {
-    console.log('Usage: node scripts/ws-device-simulator.mjs <sit|away|crash|reconnect|badtoken|malformed|twice|ping> [--url=...] [--token=...] [--id=...]');
+  if (!command || !['sit', 'away', 'crash', 'reconnect', 'badtoken', 'malformed', 'twice', 'ping', 'sensor'].includes(command)) {
+    console.log('Usage: node scripts/ws-device-simulator.mjs <sit|away|crash|reconnect|badtoken|malformed|twice|ping|sensor> [--url=...] [--token=...] [--id=...]');
     process.exit(1);
   }
   if (!token) {
@@ -232,6 +232,22 @@ async function main() {
     b.close();
     await sleep(300);
     process.exit(a.closed.code === 4000 ? 0 : 1);
+  }
+
+  if (command === 'sensor') {
+    const d = new Device(deviceId);
+    await d.connect();
+    d.authenticate();
+    if (!(await d.waitAuth())) { console.error('FAILED: not authenticated'); process.exit(1); }
+    console.log('Streaming sensor readings every 2s for 10s (watch the dashboard distance / SSE stream)...');
+    const readings = [82.5, 84.0, 79.3, 121.2, -1.0];
+    for (let i = 0; i < 5; i++) {
+      d.send({ type: 'sensor', deviceId: d.id, distance: readings[i] });
+      await sleep(2000);
+    }
+    d.close();
+    await sleep(200);
+    process.exit(0);
   }
 
   if (command === 'ping') {

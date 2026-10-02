@@ -18,6 +18,7 @@ import { Bell, Flame, ShieldAlert, Sparkles, X, HeartPulse, Volume2 } from 'luci
 
 export default function DashboardPage() {
   const [data, setData] = useState<DashboardStatsResponse | null>(null);
+  const [distanceCm, setDistanceCm] = useState<number | null>(null);
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [isPolling, setIsPolling] = useState<boolean>(true);
   const [simulating, setSimulating] = useState<boolean>(false);
@@ -79,6 +80,7 @@ export default function DashboardPage() {
 
       const json: DashboardStatsResponse = await res.json();
       setData(json);
+      setDistanceCm(typeof json.distanceCm === 'number' ? json.distanceCm : null);
       setErrorMessage(null);
 
       const currentStatus = json.status;
@@ -209,6 +211,11 @@ export default function DashboardPage() {
         es.onmessage = (event) => {
           try {
             const payload = JSON.parse(event.data);
+            if (payload.type === 'DISTANCE') {
+              // Lightweight telemetry push — no status refetch needed
+              setDistanceCm(typeof payload.distanceCm === 'number' ? payload.distanceCm : null);
+              return;
+            }
             if (payload.type === 'STATUS_CHANGE') {
               console.log('[Real-Time Telemetry] Instant event received from NodeMCU:', payload.action);
               // Trigger instant data refresh, audio chime, and notification (< 20ms)
@@ -237,16 +244,18 @@ export default function DashboardPage() {
     };
   }, [fetchStatus]);
 
-  // Background polling: runs every 4.5 seconds via dedicated Web Worker as a fallback heartbeat.
-  // Dedicated Web Workers bypass Chrome's background tab timer throttling completely,
-  // ensuring telemetry is checked whether the tab is focused, minimized, or in the background.
+  // Background polling: runs every 30 seconds via dedicated Web Worker as a
+  // safety net. Real-time updates arrive instantly over SSE (device events AND
+  // live distance); this slow poll only reconciles the UI if SSE silently died
+  // and triggers the server's stale-session auto-close check. Dedicated Web
+  // Workers bypass Chrome's background tab timer throttling completely.
   useEffect(() => {
     if (!isPolling) {
       backgroundTimer.stop();
       return;
     }
 
-    backgroundTimer.start(4500, () => {
+    backgroundTimer.start(30000, () => {
       fetchStatus(true);
     });
 
@@ -419,6 +428,7 @@ export default function DashboardPage() {
           onSimulate={handleSimulate}
           simulating={simulating}
           configured={data?.configured ?? true}
+          distanceCm={distanceCm}
         />
 
         {/* Break Target & Ergonomics Quick Selector */}

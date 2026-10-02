@@ -3,7 +3,7 @@
 import React, { useEffect, useState } from 'react';
 import { SittingSession, SittingStatus } from '@/types/sitting';
 import { formatHMS, formatTimeOnly } from '@/lib/timeUtils';
-import { UserCheck, UserX, Clock, Flame, Play, Square, AlertCircle } from 'lucide-react';
+import { UserCheck, UserX, Clock, Flame, Play, Square, AlertCircle, Radar } from 'lucide-react';
 
 interface StatusCardProps {
   status: SittingStatus;
@@ -11,6 +11,8 @@ interface StatusCardProps {
   onSimulate: (action: 'start' | 'stop') => Promise<void>;
   simulating: boolean;
   configured: boolean;
+  /** Live ultrasonic reading (cm), pushed from the device via SSE */
+  distanceCm: number | null;
 }
 
 export function StatusCard({
@@ -19,6 +21,7 @@ export function StatusCard({
   onSimulate,
   simulating,
   configured,
+  distanceCm,
 }: StatusCardProps) {
   // Live duration ticker updated client-side every 1000ms using started_at
   const [liveElapsed, setLiveElapsed] = useState<number>(0);
@@ -88,8 +91,13 @@ export function StatusCard({
               {isSitting ? 'Currently Sitting' : 'Currently Away'}
             </span>
 
-            <span className="text-xs text-zinc-500 font-mono">
-              {isSitting ? 'HC-SR04 <= 100 cm' : 'HC-SR04 > 100 cm'}
+            <span className="text-xs text-zinc-500 font-mono inline-flex items-center gap-1.5">
+              <Radar className={`w-3.5 h-3.5 ${distanceCm !== null ? 'text-emerald-400' : 'text-zinc-600'}`} />
+              {distanceCm !== null
+                ? distanceCm >= 0
+                  ? `${distanceCm.toFixed(1)} cm`
+                  : 'out of range'
+                : 'waiting for sensor…'}
             </span>
           </div>
 
