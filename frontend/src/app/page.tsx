@@ -251,18 +251,47 @@ export default function DashboardPage() {
   // Workers bypass Chrome's background tab timer throttling completely.
   useEffect(() => {
     if (!isPolling) {
-      backgroundTimer.stop();
+      backgroundTimer.stop('poll');
       return;
     }
 
-    backgroundTimer.start(30000, () => {
+    backgroundTimer.start('poll', 30000, () => {
       fetchStatus(true);
     });
 
     return () => {
-      backgroundTimer.stop();
+      backgroundTimer.stop('poll');
     };
   }, [isPolling, fetchStatus]);
+
+  // ── Live tab title ─────────────────────────────────────────────────────────
+  // Shows the running session timer (or "Off") in the browser tab strip, so
+  // you can glance at the time without opening the page. Driven by the Web
+  // Worker because background tabs throttle normal 1s timers to 1/minute.
+  // (activeSession is non-null exactly when the backend reports SITTING.)
+  const activeSession = data?.activeSession ?? null;
+  useEffect(() => {
+    const baseTitle = 'Sitting Time Tracker';
+
+    if (!activeSession) {
+      document.title = `⏸ Off · ${baseTitle}`;
+      return;
+    }
+
+    const startMs = new Date(activeSession.started_at).getTime();
+    const tick = () => {
+      const s = Math.max(0, Math.floor((Date.now() - startMs) / 1000));
+      const pad = (n: number) => String(n).padStart(2, '0');
+      document.title = `⏱ ${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)} · Sitting`;
+    };
+
+    tick();
+    backgroundTimer.start('title', 1000, tick);
+    return () => {
+      backgroundTimer.stop('title');
+      document.title = baseTitle;
+    };
+  }, [activeSession]);
 
   // Break reminder watcher
   const activeDurationSec = data?.activeDurationSeconds ?? 0;

@@ -6,17 +6,21 @@
  * per minute when a tab is in the background or minimized.
  * However, dedicated Web Workers run in a background OS thread and are NOT
  * throttled by Chrome's background tab timers.
- * 
- * This ensures the tracker checks telemetry every 4-5 seconds like clockwork,
- * even if the user is on other tabs, playing games, or in other applications.
+ *
+ * This ensures time-sensitive updates (telemetry polling, the live tab-title
+ * timer) keep ticking like clockwork even if the user is on other tabs,
+ * playing games, or in other applications.
+ *
+ * Supports multiple named timers — call start(name, intervalMs, onTick) and
+ * stop(name).
  */
 
 type TickCallback = () => void;
 
 class BackgroundTimer {
   private worker: Worker | null = null;
-  private callback: TickCallback | null = null;
-  private fallbackInterval: ReturnType<typeof setInterval> | null = null;
+  private callbacks = new Map<string, TickCallback>();
+  private fallbackIntervals = new Map<string, ReturnType<typeof setInterval>>();
 
   constructor() {
     if (typeof window === 'undefined') return;
@@ -24,19 +28,20 @@ class BackgroundTimer {
     try {
       // Inline worker blob code - zero network dependency, loads instantly
       const workerCode = `
-        let timer = null;
+        let timers = {};
         self.onmessage = function(e) {
           if (!e.data) return;
           if (e.data.action === 'start') {
-            if (timer) clearInterval(timer);
-            const interval = e.data.interval || 4000;
-            timer = setInterval(function() {
-              self.postMessage('tick');
-            }, interval);
+            const name = e.data.name;
+            if (timers[name]) clearInterval(timers[name]);
+            timers[name] = setInterval(function() {
+              self.postMessage({ name: name });
+            }, e.data.interval || 4000);
           } else if (e.data.action === 'stop') {
-            if (timer) {
-              clearInterval(timer);
-              timer = null;
+            const name = e.data.name;
+            if (timers[name]) {
+              clearInterval(timers[name]);
+              delete timers[name];
             }
           }
         };
@@ -46,9 +51,9 @@ class BackgroundTimer {
       this.worker = new Worker(workerUrl);
 
       this.worker.onmessage = (e) => {
-        if (e.data === 'tick' && this.callback) {
-          this.callback();
-        }
+        const name = e.data?.name;
+        const callback = name ? this.callbacks.get(name) : undefined;
+        if (callback) callback();
       };
 
       this.worker.onerror = (err) => {
@@ -59,25 +64,28 @@ class BackgroundTimer {
     }
   }
 
-  public start(intervalMs: number, onTick: TickCallback): void {
-    this.callback = onTick;
+  public start(name: string, intervalMs: number, onTick: TickCallback): void {
+    this.callbacks.set(name, onTick);
 
     if (this.worker) {
-      this.worker.postMessage({ action: 'start', interval: intervalMs });
+      this.worker.postMessage({ action: 'start', name, interval: intervalMs });
     } else {
       // Fallback if workers are blocked
-      if (this.fallbackInterval) clearInterval(this.fallbackInterval);
-      this.fallbackInterval = setInterval(onTick, intervalMs);
+      const existing = this.fallbackIntervals.get(name);
+      if (existing) clearInterval(existing);
+      this.fallbackIntervals.set(name, setInterval(onTick, intervalMs));
     }
   }
 
-  public stop(): void {
+  public stop(name: string): void {
+    this.callbacks.delete(name);
     if (this.worker) {
-      this.worker.postMessage({ action: 'stop' });
+      this.worker.postMessage({ action: 'stop', name });
     }
-    if (this.fallbackInterval) {
-      clearInterval(this.fallbackInterval);
-      this.fallbackInterval = null;
+    const fallback = this.fallbackIntervals.get(name);
+    if (fallback) {
+      clearInterval(fallback);
+      this.fallbackIntervals.delete(name);
     }
   }
 }
