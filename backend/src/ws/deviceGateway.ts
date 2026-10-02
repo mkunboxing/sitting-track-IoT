@@ -18,7 +18,7 @@ import { eventBroadcaster } from '../lib/eventBroadcaster';
  * - An unexpected disconnect does NOT close the session immediately:
  *   managed platforms force-close long-lived WebSocket connections (e.g.
  *   Cloud Run's request timeout), so the session is left active and is
- *   auto-closed by /status's stale-check (90s, ended_at = last contact)
+ *   auto-closed by /status's stale-check (30s, ended_at = last contact)
  *   only if the device does not reconnect. Fast reconnects therefore
  *   continue the same session with no fragmentation.
  *
@@ -40,7 +40,10 @@ import { eventBroadcaster } from '../lib/eventBroadcaster';
 
 const WS_PATH = '/ws/device';
 const AUTH_TIMEOUT_MS = 10_000; // must authenticate within 10s of connecting
-const PING_INTERVAL_MS = 30_000; // stale-connection detection (protocol ping/pong)
+// Stale-connection detection + liveness touch cadence. Must stay well under
+// the /status stale-check threshold (30s) so a connected device's
+// last_heartbeat_at never looks stale between touches.
+const PING_INTERVAL_MS = 10_000;
 
 interface DeviceConnection {
   ws: WebSocket;
@@ -189,11 +192,11 @@ export function attachDeviceGateway(server: HttpServer): WebSocketServer {
       // session on every forced drop would fragment sitting sessions.
       //
       // Instead, last_heartbeat_at stops being touched and the /status
-      // endpoint's existing stale-check (90s) closes the session — with
-      // ended_at set to the last-contact time — if the device does not
-      // return. A device that reconnects and syncs "sitting" within the
-      // grace window finds its session still active (already_active) and
-      // the session continues unbroken.
+      // endpoint's stale-check (30s) closes the session — with ended_at set
+      // to the last-contact time — if the device does not return. A device
+      // that reconnects and syncs "sitting" within the grace window finds
+      // its session still active (already_active) and the session continues
+      // unbroken.
       console.log(`[WS] Waiting for reconnect — any active session auto-closes via stale-check if the device stays offline`);
     });
   });

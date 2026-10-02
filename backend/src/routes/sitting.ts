@@ -84,8 +84,10 @@ sittingRouter.get('/status', async (req, res) => {
         : new Date(activeSession.started_at).getTime();
 
       const timeSinceCheck = now.getTime() - lastCheckTime;
-      // If module has been silent for > 90 seconds (and heartbeat was established) or > 8 hours (stale safety)
-      const isStaleHeartbeat = activeSession.last_heartbeat_at && timeSinceCheck > 90 * 1000;
+      // If module has been silent for > 30 seconds (and heartbeat was established) or > 8 hours (stale safety).
+      // The WS gateway touches last_heartbeat_at every 10s while connected, so a
+      // live device never trips this; it only fires for a genuinely gone device.
+      const isStaleHeartbeat = activeSession.last_heartbeat_at && timeSinceCheck > 30 * 1000;
       const isUnreasonablyOld = timeSinceCheck > 8 * 3600 * 1000;
 
       if (isStaleHeartbeat || isUnreasonablyOld) {

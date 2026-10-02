@@ -81,7 +81,7 @@ The ESP8266 talks to the backend over a **persistent WebSocket** (library: `WebS
 ### Liveness, disconnects & reconnects
 
 - **Keepalive:** the ESP pings every 15s (`enableHeartbeat`) and the backend pings every 30s; dead sockets are terminated. While a device is connected, the backend touches `last_heartbeat_at`, so the `/status` stale-check keeps working unchanged.
-- **Unexpected disconnect** (Wi-Fi loss, power-off, platform-forced drop): the session is **not** closed instantly — managed platforms like Cloud Run force-close long-lived WebSocket connections periodically, and closing on every drop would fragment sessions. Instead the session is left active and auto-closed by the `/status` stale-check (~90 s, `ended_at` = last-contact time) **only if the device does not return**. A device that reconnects quickly and syncs `sitting` continues the same session (`already_active`) with no fragmentation.
+- **Unexpected disconnect** (Wi-Fi loss, power-off, platform-forced drop): the session is **not** closed instantly — managed platforms like Cloud Run force-close long-lived WebSocket connections periodically, and closing on every drop would fragment sessions. Instead the session is left active and auto-closed by the `/status` stale-check (~30 s, `ended_at` = last-contact time) **only if the device does not return**. A device that reconnects quickly and syncs `sitting` continues the same session (`already_active`) with no fragmentation.
 - **Reconnect:** the ESP reconnects every 5s (no rapid loops), re-authenticates, then sends only its **current** state. Backend handling is idempotent, so normal reconnects never create duplicate sessions: `sitting` with an active session → no-op; `away` without one → no-op.
 - **State change while offline:** nothing is queued or replayed — the ESP holds its current state locally and sends it once after the next successful authentication (never a stale event).
 - **Live distance:** the device sends its latest HC-SR04 reading every 5 s; the backend pushes it to all dashboard tabs as a `{"type":"DISTANCE",…}` SSE event (no status refetch needed) and includes it in `/status` responses as `distanceCm`. In-memory only — nothing is persisted.
@@ -292,7 +292,7 @@ const char* DEVICE_TOKEN = "your-device-token";
 | :--- | :--- |
 | **NodeMCU restarts while sitting** | Device reconnects, authenticates and syncs its current state over the WebSocket. Backend checks if an active session already exists — if yes, it returns `already_active` without creating a duplicate. |
 | **Duplicate START / STOP events** | Idempotent design. Redundant `state_change: sitting` returns the active session; redundant `state_change: away` is a safe no-op. |
-| **Unexpected device disconnect** | Detected instantly via the WebSocket close/missed pings. The session stays active for a grace window — if the device reconnects (its 5 s retry), the same session continues; if it stays offline, the `/status` stale-check closes it (~90 s) with `ended_at` = last-contact time. |
+| **Unexpected device disconnect** | Detected instantly via the WebSocket close/missed pings. The session stays active for a grace window — if the device reconnects (its 5 s retry), the same session continues; if it stays offline, the `/status` stale-check closes it (~30 s) with `ended_at` = last-contact time. |
 | **State change while offline** | The firmware holds only its current state; after reconnect + authentication it sends that single current state. Stale events are never replayed, and idempotent handling prevents duplicate sessions. |
 | **Stale TCP connection (device silently unreachable)** | Two keepalive layers: the ESP pings every 15s, the backend pings every 30s; a missed pong terminates the socket, which then triggers the disconnect handling above. |
 | **Session crossing midnight** | The statistics engine computes the mathematical intersection between any session `[started_at, ended_at]` and the day's boundaries `[00:00:00, 23:59:59]`. A session starting at 23:45 and ending at 00:30 correctly attributes 15m to yesterday and 30m to today. |
@@ -315,7 +315,7 @@ export DEVICE_TOKEN=your-device-token
 node scripts/ws-device-simulator.mjs sit        # open a session
 node scripts/ws-device-simulator.mjs sit        # again → already_active, no duplicate
 node scripts/ws-device-simulator.mjs away       # close the session (prints duration ack)
-node scripts/ws-device-simulator.mjs crash      # sit, then hard-drop → session auto-closes via stale-check (~90s)
+node scripts/ws-device-simulator.mjs crash      # sit, then hard-drop → session auto-closes via stale-check (~30s)
 node scripts/ws-device-simulator.mjs reconnect  # sit → drop → reconnect → sync → away
 node scripts/ws-device-simulator.mjs badtoken   # expect auth_error + close 4001
 node scripts/ws-device-simulator.mjs sensor     # stream live distance readings (watch dashboard/SSE)

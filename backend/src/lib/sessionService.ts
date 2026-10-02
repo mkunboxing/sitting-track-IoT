@@ -152,7 +152,7 @@ export async function closeActiveSession(): Promise<CloseSessionResult> {
 
 /**
  * Liveness touch — keeps last_heartbeat_at fresh while a device is connected
- * via WebSocket. The /status endpoint's stale-session auto-close (90s/8h)
+ * via WebSocket. The /status endpoint's stale-session auto-close (30s/8h)
  * keeps working unchanged as a backstop.
  */
 export async function touchActiveSessionHeartbeat(): Promise<void> {
