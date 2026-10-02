@@ -13,6 +13,7 @@ import { soundManager } from '@/lib/soundUtils';
 import { notificationManager } from '@/lib/notificationManager';
 import { backgroundTimer } from '@/lib/backgroundTimer';
 import { formatFriendlyDuration } from '@/lib/timeUtils';
+import { apiUrl } from '@/lib/api';
 import { Bell, Flame, ShieldAlert, Sparkles, X, HeartPulse, Volume2 } from 'lucide-react';
 
 export default function DashboardPage() {
@@ -54,7 +55,7 @@ export default function DashboardPage() {
     const tz = typeof Intl !== 'undefined' ? Intl.DateTimeFormat().resolvedOptions().timeZone : 'UTC';
     const tzOffset = typeof window !== 'undefined' ? new Date().getTimezoneOffset().toString() : '0';
     return {
-      url: `/api/sitting/status?tz=${encodeURIComponent(tz)}&tzOffset=${tzOffset}`,
+      url: apiUrl(`/api/sitting/status?tz=${encodeURIComponent(tz)}&tzOffset=${tzOffset}`),
       headers: {
         'Cache-Control': 'no-cache',
         'x-timezone': tz,
@@ -203,7 +204,7 @@ export default function DashboardPage() {
       if (typeof window === 'undefined') return;
 
       try {
-        es = new EventSource('/api/sitting/stream');
+        es = new EventSource(apiUrl('/api/sitting/stream'));
 
         es.onmessage = (event) => {
           try {
@@ -279,7 +280,7 @@ export default function DashboardPage() {
   const handleSimulate = async (action: 'start' | 'stop') => {
     setSimulating(true);
     try {
-      const res = await fetch('/api/sitting/simulate', {
+      const res = await fetch(apiUrl('/api/sitting/simulate'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),

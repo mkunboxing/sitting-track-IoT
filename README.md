@@ -2,6 +2,13 @@
 
 An end-to-end IoT ergonomics telemetry system and real-time dashboard. The system automatically detects when you are sitting at your desk using a **NodeMCU ESP8266** and an **HC-SR04 ultrasonic distance sensor**, records sessions in **Supabase PostgreSQL**, and visualizes sitting habits on a **Next.js (App Router)** dashboard.
 
+The project is split into two apps:
+
+| App | Location | Role |
+| :--- | :--- | :--- |
+| **Frontend** | repo root | Next.js dashboard (static UI, calls the API server) |
+| **Backend** | [`server/`](./server) | Express (TypeScript) API + SSE streaming + Supabase access |
+
 ---
 
 ## 🏛️ Architecture
@@ -20,10 +27,14 @@ An end-to-end IoT ergonomics telemetry system and real-time dashboard. The syste
                 │ Authorization: Bearer <DEVICE_TOKEN>
                 ▼
 ┌─────────────────────────────────┐
-│       Next.js API Routes        │
+│         Express API Server      │
+│         (server/, TypeScript)   │
 │  - POST /api/sitting/start      │
 │  - POST /api/sitting/stop       │
+│  - POST /api/sitting/heartbeat  │
 │  - GET  /api/sitting/status     │
+│  - GET  /api/sitting/stream     │
+│  - POST /api/sitting/simulate   │
 └───────────────┬─────────────────┘
                 │
                 │ Supabase Service-Role
@@ -92,10 +103,11 @@ HC-SR04 ECHO (5V) ───[ 1kΩ Resistor ]───┬───► NodeMCU D5 
 
 ## ⚙️ Environment Variables Configuration
 
-Create a file named `.env.local` in the project root:
+### Backend — `server/.env`
 
 ```bash
-cp .env.example .env.local
+cd server
+cp .env.example .env
 ```
 
 Fill in your secrets:
@@ -107,42 +119,51 @@ SUPABASE_URL=https://your-project-id.supabase.co
 # NEVER expose this key to the browser or client-side bundles.
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
 
-# Public URL (optional for client reference)
-NEXT_PUBLIC_SUPABASE_URL=https://your-project-id.supabase.co
-
 # Shared Secret Device Token
 # The NodeMCU ESP8266 must include this in: "Authorization: Bearer <DEVICE_TOKEN>"
 DEVICE_TOKEN=tracker-secret-device-key-change-me
+
+# Express server
+PORT=4000
+# Allowed origin(s) of the Next.js frontend, comma-separated
+CORS_ORIGIN=http://localhost:3000
+```
+
+### Frontend — `.env.local` (repo root)
+
+```env
+# Base URL of the Express backend (empty = same origin)
+NEXT_PUBLIC_API_URL=http://localhost:4000
 ```
 
 > [!IMPORTANT]
-> The `DEVICE_TOKEN` is your authentication secret between your ESP8266 and the Next.js API. Keep it random and secure.
+> The `DEVICE_TOKEN` is your authentication secret between your ESP8266 and the Express API. Keep it random and secure.
 
 ---
 
-## 🚀 Running the Next.js Web Application
+## 🚀 Running the Apps
 
 ### Local Development
-```bash
-# Install dependencies
-npm install
 
-# Run development server
+Run both processes in separate terminals:
+
+```bash
+# Terminal 1 — Express backend (http://localhost:4000)
+cd server
+npm install
+npm run dev
+
+# Terminal 2 — Next.js frontend (http://localhost:3000)
+npm install
 npm run dev
 ```
 
-Open [http://localhost:3000](http://localhost:3000) in your browser.
+Open [http://localhost:3000](http://localhost:3000) in your browser. The dashboard talks to the API on `:4000` via `NEXT_PUBLIC_API_URL` (CORS is already configured).
 
-### Deploying to Vercel
-1. Push this repository to GitHub or GitLab.
-2. Go to [vercel.com](https://vercel.com) and click **"Add New Project"**.
-3. Import this repository.
-4. Add the following **Environment Variables** in the Vercel project settings:
-   - `SUPABASE_URL`
-   - `SUPABASE_SERVICE_ROLE_KEY`
-   - `NEXT_PUBLIC_SUPABASE_URL`
-   - `DEVICE_TOKEN`
-5. Click **Deploy**. Vercel will provide your live URL (e.g., `https://smart-tracking.vercel.app`).
+### Deploying
+
+- **Frontend (repo root)** — deploys to Vercel as before. Set the `NEXT_PUBLIC_API_URL` environment variable to the public URL of your Express server (it is inlined into the client bundle at build time).
+- **Backend (`server/`)** — needs an **always-on host** because it holds long-lived SSE connections (`GET /api/sitting/stream`); serverless platforms like Vercel Functions will not keep them open. Use Railway, Render, Fly.io, or a VPS. Build with `npm run build`, start with `npm start`, and set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEVICE_TOKEN`, `PORT`, and `CORS_ORIGIN` (include your Vercel frontend URL) there.
 
 ---
 
@@ -169,16 +190,19 @@ Open [`firmware/sitting_tracker/sitting_tracker.ino`](./firmware/sitting_tracker
 const char* WIFI_SSID     = "Your_Home_WiFi";
 const char* WIFI_PASSWORD = "Your_WiFi_Password";
 
-// 2. Set your Live API URL:
+// 2. Set your Live API URL (the Express backend, NOT the Next.js frontend):
 // For testing locally (replace with your computer's LAN IP address):
-// const char* SERVER_BASE_URL = "http://192.168.1.120:3000";
+// const char* SERVER_BASE_URL = "http://192.168.1.120:4000";
 //
-// For production on Vercel (HTTPS is fully supported!):
-const char* SERVER_BASE_URL = "https://smart-tracking.vercel.app";
+// For production (your always-on Express host — Railway/Render/Fly/VPS):
+const char* SERVER_BASE_URL = "https://your-express-host.example.com";
 
-// 3. Set the Device Authentication Token (must match DEVICE_TOKEN in .env.local / Vercel)
+// 3. Set the Device Authentication Token (must match DEVICE_TOKEN in server/.env)
 const char* DEVICE_TOKEN    = "tracker-secret-device-key-change-me";
 ```
+
+> [!NOTE]
+> The firmware talks to the **Express backend**, not the Next.js frontend. Repoint `SERVER_BASE_URL` to wherever you deploy `server/` — the old Vercel URL only serves the dashboard now.
 
 ### Flashing the NodeMCU
 1. Connect the NodeMCU to your computer via micro-USB.
@@ -213,21 +237,21 @@ You can test the endpoints directly from your terminal:
 
 ### 1. Test Starting a Session
 ```bash
-curl -X POST http://localhost:3000/api/sitting/start \
+curl -X POST http://localhost:4000/api/sitting/start \
   -H "Authorization: Bearer tracker-secret-device-key-change-me" \
   -H "Content-Type: application/json"
 ```
 
 ### 2. Test Stopping a Session
 ```bash
-curl -X POST http://localhost:3000/api/sitting/stop \
+curl -X POST http://localhost:4000/api/sitting/stop \
   -H "Authorization: Bearer tracker-secret-device-key-change-me" \
   -H "Content-Type: application/json"
 ```
 
 ### 3. Check Live Telemetry
 ```bash
-curl http://localhost:3000/api/sitting/status
+curl http://localhost:4000/api/sitting/status
 ```
 
 ---
