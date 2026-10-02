@@ -37,12 +37,23 @@ export default function RootLayout({
   return (
     <html
       lang="en"
+      // suppressHydrationWarning: the theme bootstrap script (first child of
+      // body) may remove the `dark` class before React hydrates
+      suppressHydrationWarning
       className={`${geistSans.variable} ${geistMono.variable} h-full antialiased dark`}
     >
       <body
         suppressHydrationWarning
-        className="min-h-full flex flex-col bg-zinc-950 text-zinc-100 font-sans selection:bg-emerald-500 selection:text-white"
+        className="min-h-full flex flex-col bg-app text-ink font-sans selection:bg-emerald-500 selection:text-ink-bright"
       >
+        {/* Theme bootstrap: runs before first paint so a saved light theme
+            never flashes dark. Default (no saved choice) is dark. */}
+        <script
+          dangerouslySetInnerHTML={{
+            __html:
+              "try{if(localStorage.getItem('theme')==='light')document.documentElement.classList.remove('dark')}catch(e){}",
+          }}
+        />
         {children}
       </body>
     </html>

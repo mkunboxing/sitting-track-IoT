@@ -14,7 +14,7 @@ import { notificationManager } from '@/lib/notificationManager';
 import { backgroundTimer } from '@/lib/backgroundTimer';
 import { formatFriendlyDuration } from '@/lib/timeUtils';
 import { apiUrl } from '@/lib/api';
-import { Bell, Flame, ShieldAlert, Sparkles, X, HeartPulse, Volume2 } from 'lucide-react';
+import { Bell, Flame, ShieldAlert, Sparkles, X, HeartPulse, Volume2, Play, Square } from 'lucide-react';
 
 export default function DashboardPage() {
   const [data, setData] = useState<DashboardStatsResponse | null>(null);
@@ -37,12 +37,40 @@ export default function DashboardPage() {
   const [breakAlertDismissed, setBreakAlertDismissed] = useState<boolean>(false);
   const breakAlarmPlayedRef = useRef<boolean>(false);
 
-  // Toggle sound
+  // Toggle sound (persisted — survives page refresh)
   const handleToggleSound = () => {
     const nextState = !soundEnabled;
     soundManager.setEnabled(nextState);
     setSoundEnabled(nextState);
+    try { window.localStorage.setItem('soundEnabled', String(nextState)); } catch { /* storage unavailable */ }
   };
+
+  // Change the break reminder interval (persisted — survives page refresh)
+  const updateBreakInterval = (mins: number) => {
+    setBreakIntervalMin(mins);
+    setBreakAlertDismissed(false);
+    try { window.localStorage.setItem('breakIntervalMin', String(mins)); } catch { /* storage unavailable */ }
+  };
+
+  // ── Restore persisted UI settings after mount ──────────────────────────────
+  // The page is statically prerendered, so localStorage can only be read
+  // client-side in an effect (server-safe); defaults render for one frame.
+  useEffect(() => {
+    try {
+      const savedBreak = window.localStorage.getItem('breakIntervalMin');
+      if (savedBreak !== null && [0, 30, 45, 60].includes(Number(savedBreak))) {
+        setBreakIntervalMin(Number(savedBreak));
+      }
+      const savedSound = window.localStorage.getItem('soundEnabled');
+      if (savedSound === 'true' || savedSound === 'false') {
+        const enabled = savedSound === 'true';
+        setSoundEnabled(enabled);
+        soundManager.setEnabled(enabled);
+      }
+    } catch {
+      // Private mode / storage disabled — keep defaults
+    }
+  }, []);
 
   // Request notifications and unlock audio engine
   const handleEnableAlerts = async () => {
@@ -347,7 +375,7 @@ export default function DashboardPage() {
   };
 
   return (
-    <div className="min-h-screen flex flex-col bg-zinc-950 text-zinc-100">
+    <div className="min-h-screen flex flex-col bg-app text-ink">
       {/* Header with live sync, notification permission & sound controls */}
       <Header
         isPolling={isPolling}
@@ -368,14 +396,14 @@ export default function DashboardPage() {
         {notificationPermission !== 'granted' && !bannerDismissed && (
           <div className="p-4 rounded-2xl bg-gradient-to-r from-emerald-500/15 via-teal-500/10 to-transparent border border-emerald-500/30 flex items-center justify-between gap-4 shadow-lg shadow-emerald-500/5">
             <div className="flex items-center gap-3">
-              <div className="p-2.5 rounded-xl bg-emerald-500/20 text-emerald-300 shrink-0">
+              <div className="p-2.5 rounded-xl bg-emerald-500/20 text-acc-emerald-soft shrink-0">
                 <Bell className="w-5 h-5 animate-bounce" />
               </div>
               <div>
-                <h4 className="text-sm font-semibold text-emerald-200">
+                <h4 className="text-sm font-semibold text-acc-emerald-strong">
                   Enable Background Audio &amp; System Notifications
                 </h4>
-                <p className="text-xs text-zinc-400 mt-0.5">
+                <p className="text-xs text-ink4 mt-0.5">
                   Allow browser notifications so you hear sound chimes and get alerts when sitting starts, stops, or when it's time for a stretch break even while browsing other tabs.
                 </p>
               </div>
@@ -392,7 +420,7 @@ export default function DashboardPage() {
               <button
                 type="button"
                 onClick={() => setBannerDismissed(true)}
-                className="p-1.5 rounded-lg text-zinc-400 hover:text-white hover:bg-zinc-800 transition-colors"
+                className="p-1.5 rounded-lg text-ink4 hover:text-ink-bright hover:bg-chip transition-colors"
                 title="Dismiss banner"
               >
                 <X className="w-4 h-4" />
@@ -403,14 +431,14 @@ export default function DashboardPage() {
 
         {/* Error notification banner if any */}
         {errorMessage && (
-          <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs flex items-center justify-between">
+          <div className="p-4 rounded-xl bg-rose-500/10 border border-rose-500/20 text-acc-rose-soft text-xs flex items-center justify-between">
             <div className="flex items-center gap-2">
-              <ShieldAlert className="w-4 h-4 text-rose-400 shrink-0" />
+              <ShieldAlert className="w-4 h-4 text-acc-rose shrink-0" />
               <span>Unable to sync live telemetry: {errorMessage}</span>
             </div>
             <button
               onClick={() => fetchStatus(false)}
-              className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-rose-200 font-medium active:scale-[0.96]"
+              className="px-2.5 py-1 rounded-lg bg-rose-500/20 hover:bg-rose-500/30 text-acc-rose-strong font-medium active:scale-[0.96]"
             >
               Retry
             </button>
@@ -419,20 +447,20 @@ export default function DashboardPage() {
 
         {/* Ergonomic Break Alert Banner (Triggers after sitting duration exceeds threshold) */}
         {shouldTriggerBreak && !breakAlertDismissed && (
-          <div className="relative overflow-hidden p-4 sm:p-5 rounded-2xl bg-gradient-to-r from-amber-500/20 via-orange-500/15 to-amber-500/10 border border-amber-500/40 text-amber-200 shadow-xl shadow-amber-500/5 animate-pulse">
+          <div className="relative overflow-hidden p-4 sm:p-5 rounded-2xl bg-gradient-to-r from-amber-500/20 via-orange-500/15 to-amber-500/10 border border-amber-500/40 text-acc-amber-strong shadow-xl shadow-amber-500/5 animate-pulse">
             <div className="flex items-start sm:items-center justify-between gap-4">
               <div className="flex items-center gap-3">
-                <div className="p-2.5 rounded-xl bg-amber-500/20 text-amber-300 shrink-0">
+                <div className="p-2.5 rounded-xl bg-amber-500/20 text-acc-amber-soft shrink-0">
                   <Flame className="w-6 h-6 animate-bounce" />
                 </div>
                 <div>
-                  <h4 className="text-sm sm:text-base font-bold text-amber-100 flex items-center gap-2">
+                  <h4 className="text-sm sm:text-base font-bold text-acc-amber-strong flex items-center gap-2">
                     Time for a Stretch Break!
-                    <span className="text-xs px-2 py-0.5 rounded-full bg-amber-400/20 text-amber-300 border border-amber-400/30">
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-amber-400/20 text-acc-amber-soft border border-amber-400/30">
                       {Math.floor(activeDurationSec / 60)}m Sitting
                     </span>
                   </h4>
-                  <p className="text-xs text-amber-200/90 mt-0.5">
+                  <p className="text-xs text-acc-amber-strong/90 mt-0.5">
                     You have reached your {breakIntervalMin}-minute target. Stand up, take a walk, hydrate, and relax your eyes for 2-3 minutes.
                   </p>
                 </div>
@@ -449,7 +477,7 @@ export default function DashboardPage() {
                 <button
                   type="button"
                   onClick={() => setBreakAlertDismissed(true)}
-                  className="p-1.5 rounded-lg text-amber-400 hover:text-white hover:bg-amber-500/20 transition-colors"
+                  className="p-1.5 rounded-lg text-acc-amber hover:text-ink-bright hover:bg-amber-500/20 transition-colors"
                   title="Dismiss alert"
                 >
                   <X className="w-4 h-4" />
@@ -470,11 +498,11 @@ export default function DashboardPage() {
         />
 
         {/* Break Target & Ergonomics Quick Selector */}
-        <div className="p-4 rounded-2xl bg-zinc-900/40 border border-zinc-800/80 flex flex-wrap items-center justify-between gap-3 text-xs">
-          <div className="flex items-center gap-2 text-zinc-300 font-medium">
-            <Bell className="w-4 h-4 text-emerald-400" />
+        <div className="p-4 rounded-2xl bg-panel/40 border border-edge/80 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex items-center gap-2 text-ink3 font-medium">
+            <Bell className="w-4 h-4 text-acc-emerald" />
             <span>Ergonomic Break Reminder:</span>
-            <span className="text-zinc-500 hidden sm:inline">• Alert sound and visual toast when threshold reached</span>
+            <span className="text-ink5 hidden sm:inline">• Alert sound and visual toast when threshold reached</span>
           </div>
 
           <div className="flex items-center gap-1.5">
@@ -482,14 +510,11 @@ export default function DashboardPage() {
               <button
                 key={mins}
                 type="button"
-                onClick={() => {
-                  setBreakIntervalMin(mins);
-                  setBreakAlertDismissed(false);
-                }}
+                onClick={() => updateBreakInterval(mins)}
                 className={`px-3 py-1 rounded-lg text-xs font-semibold border transition-all active:scale-[0.96] ${
                   breakIntervalMin === mins
-                    ? 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-sm'
-                    : 'bg-zinc-800/60 text-zinc-400 border-zinc-700/60 hover:text-zinc-200'
+                    ? 'bg-emerald-500/20 text-acc-emerald-soft border-emerald-500/40 shadow-sm'
+                    : 'bg-chip/60 text-ink4 border-edge-strong/60 hover:text-ink2'
                 }`}
               >
                 Every {mins}m
@@ -497,11 +522,11 @@ export default function DashboardPage() {
             ))}
             <button
               type="button"
-              onClick={() => setBreakIntervalMin(0)}
+              onClick={() => updateBreakInterval(0)}
               className={`px-2.5 py-1 rounded-lg text-xs font-medium border transition-all active:scale-[0.96] ${
                 breakIntervalMin === 0
-                  ? 'bg-zinc-700 text-zinc-200 border-zinc-600'
-                  : 'bg-zinc-800/60 text-zinc-500 border-zinc-700/60 hover:text-zinc-300'
+                  ? 'bg-edge-strong text-ink2 border-chip-strong'
+                  : 'bg-chip/60 text-ink5 border-edge-strong/60 hover:text-ink3'
               }`}
             >
               Off
@@ -531,34 +556,34 @@ export default function DashboardPage() {
         </div>
 
         {/* 4. Ergonomics & Desk Health Advice Widget */}
-        <div className="p-5 rounded-2xl border border-zinc-800/80 bg-gradient-to-br from-zinc-900/60 via-zinc-900/40 to-zinc-950 text-xs text-zinc-400 space-y-3">
-          <div className="flex items-center gap-2 text-zinc-200 font-semibold text-sm">
-            <HeartPulse className="w-4 h-4 text-emerald-400" />
+        <div className="p-5 rounded-2xl border border-edge/80 bg-gradient-to-br from-panel/60 via-panel/40 to-app text-xs text-ink4 space-y-3">
+          <div className="flex items-center gap-2 text-ink2 font-semibold text-sm">
+            <HeartPulse className="w-4 h-4 text-acc-emerald" />
             <span>Ergonomics &amp; Health Best Practices</span>
-            <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-emerald-400 border border-emerald-500/20 ml-auto hidden sm:inline">
+            <span className="text-[10px] px-2 py-0.5 rounded-full bg-emerald-500/10 text-acc-emerald border border-emerald-500/20 ml-auto hidden sm:inline">
               <Sparkles className="w-3 h-3 inline mr-1" />
               Pro Tips
             </span>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1 text-zinc-300">
-            <div className="p-3 rounded-xl bg-zinc-950/60 border border-zinc-800/60">
-              <p className="font-semibold text-white mb-1">👀 20-20-20 Rule</p>
-              <p className="text-[11px] text-zinc-400 leading-relaxed">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 pt-1 text-ink3">
+            <div className="p-3 rounded-xl bg-well/60 border border-edge/60">
+              <p className="font-semibold text-ink-bright mb-1">👀 20-20-20 Rule</p>
+              <p className="text-[11px] text-ink4 leading-relaxed">
                 Every 20 minutes, gaze at an object 20 feet away for at least 20 seconds to prevent digital eye strain.
               </p>
             </div>
 
-            <div className="p-3 rounded-xl bg-zinc-950/60 border border-zinc-800/60">
-              <p className="font-semibold text-white mb-1">🧍 Stand Up Cadence</p>
-              <p className="text-[11px] text-zinc-400 leading-relaxed">
+            <div className="p-3 rounded-xl bg-well/60 border border-edge/60">
+              <p className="font-semibold text-ink-bright mb-1">🧍 Stand Up Cadence</p>
+              <p className="text-[11px] text-ink4 leading-relaxed">
                 Stand up and stretch for 2 minutes after every 45–60 minutes of sitting to boost circulation and metabolism.
               </p>
             </div>
 
-            <div className="p-3 rounded-xl bg-zinc-950/60 border border-zinc-800/60">
-              <p className="font-semibold text-white mb-1">🪑 Posture Check</p>
-              <p className="text-[11px] text-zinc-400 leading-relaxed">
+            <div className="p-3 rounded-xl bg-well/60 border border-edge/60">
+              <p className="font-semibold text-ink-bright mb-1">🪑 Posture Check</p>
+              <p className="text-[11px] text-ink4 leading-relaxed">
                 Keep feet flat on the floor, elbows at 90°, and your top of the screen at eye level.
               </p>
             </div>
@@ -567,17 +592,45 @@ export default function DashboardPage() {
       </main>
 
       {/* Footer */}
-      <footer className="border-t border-zinc-900 bg-zinc-950 py-6 text-xs text-zinc-500">
+      <footer className="border-t border-edge bg-app py-6 text-xs text-ink5">
         <div className="max-w-7xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-4">
           <div className="flex items-center gap-2.5">
             <Logo size="xs" animated={false} />
-            <p className="font-medium text-zinc-400">
-              Sitting Time Tracker <span className="text-zinc-600">•</span> NodeMCU ESP8266 + HC-SR04 IoT Telemetry
+            <p className="font-medium text-ink4">
+              Sitting Time Tracker <span className="text-ink6">•</span> NodeMCU ESP8266 + HC-SR04 IoT Telemetry
             </p>
           </div>
-          <p className="font-mono text-[11px] text-zinc-600">
-            Background Web Worker Active • Auto-Sync 4.5s • Audio Enabled
-          </p>
+          {/* Dev simulate controls — tucked in the footer, out of the main dashboard */}
+          <div className="flex flex-col sm:flex-row items-center gap-3">
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-semibold uppercase tracking-wider text-ink6 mr-1">
+                Simulate
+              </span>
+              <button
+                type="button"
+                onClick={() => handleSimulate('start')}
+                disabled={simulating || isOccupied}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium bg-panel text-ink4 border border-edge hover:bg-chip hover:text-ink2 disabled:opacity-30 disabled:cursor-not-allowed transition-colors active:scale-[0.96]"
+                title="Simulate NodeMCU sending POST /api/sitting/start"
+              >
+                <Play className="w-3 h-3" />
+                <span>Sit Down</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleSimulate('stop')}
+                disabled={simulating || !isOccupied}
+                className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium bg-panel text-ink4 border border-edge hover:bg-chip hover:text-ink2 disabled:opacity-30 disabled:cursor-not-allowed transition-colors active:scale-[0.96]"
+                title="Simulate NodeMCU sending POST /api/sitting/stop"
+              >
+                <Square className="w-3 h-3" />
+                <span>Stand Up</span>
+              </button>
+            </div>
+            <p className="font-mono text-[11px] text-ink6">
+              Background Web Worker Active • Live Telemetry 2.5s • Audio Enabled
+            </p>
+          </div>
         </div>
       </footer>
 

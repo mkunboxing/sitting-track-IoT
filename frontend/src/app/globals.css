@@ -1,26 +1,133 @@
 @import "tailwindcss";
 
+/* Class-based dark theme: `.dark` lives on <html> (present by default).
+   The theme toggle in the Header flips the class and persists it. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ────────────────────────────────────────────────────────────────────────────
+   Theme tokens — every neutral/accent-text color in the app resolves through
+   one of these, so light/dark styling lives HERE, not in the components.
+
+   Dark values are the original hand-tuned zinc palette; light values are the
+   contrast-corrected equivalents. Alpha modifiers in class names (e.g.
+   bg-panel/50) apply on top of these base colors, in both themes.
+   ──────────────────────────────────────────────────────────────────────────── */
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  color-scheme: light;
+
+  /* Neutrals — light theme, warm "paper" tones (stone hues instead of zinc)
+     so long sessions don't feel sterile/harsh on the eyes */
+  --app: #f6f3ee;          /* page background — warm cream  (dark: #121110) */
+  --panel: #fffdfa;        /* cards — warm white            (dark: #1b1917) */
+  --well: #a8a29e;         /* inset wells, code blocks      (dark: #100e0d) */
+  --chip: #f0ece4;         /* ghost buttons, badges         (dark: #292524) */
+  --chip-strong: #ddd6ca;  /* pressed/strong chips          (dark: #57534e) */
+  --edge: #e8e2d8;         /* primary borders               (dark: #2b2824) */
+  --edge-strong: #d9d2c5;  /* strong borders, hovers        (dark: #44403c) */
+  --ink: #1c1917;          /* headings / key values         (dark: #f5f3ee) */
+  --ink2: #292524;         /* secondary strong text         (dark: #e7e5e1) */
+  --ink3: #44403c;         /* body text                     (dark: #d6d3cd) */
+  --ink4: #57534e;         /* labels, captions              (dark: #a8a29e) */
+  --ink5: #78716c;         /* faint captions                (dark: #78716c) */
+  --ink6: #a8a29e;         /* dimmest text, placeholders    (dark: #57534e) */
+  --ink-bright: #1c1917;   /* text on colored surfaces      (dark: white)   */
+
+  /* Accent text (chips/tints) — darker shades for contrast on light surfaces */
+  --acc-emerald: #059669;        /* (dark: emerald-400) */
+  --acc-emerald-soft: #047857;   /* (dark: emerald-300) */
+  --acc-emerald-strong: #065f46; /* (dark: emerald-200/50) */
+  --acc-sky: #0284c7;            /* (dark: sky-400) */
+  --acc-sky-soft: #0369a1;       /* (dark: sky-300) */
+  --acc-sky-strong: #075985;     /* (dark: sky-50) */
+  --acc-amber: #d97706;          /* (dark: amber-400) */
+  --acc-amber-soft: #b45309;     /* (dark: amber-300) */
+  --acc-amber-strong: #92400e;   /* (dark: amber-100/200) */
+  --acc-rose: #e11d48;           /* (dark: rose-400) */
+  --acc-rose-soft: #be123c;      /* (dark: rose-300) */
+  --acc-rose-strong: #9f1239;    /* (dark: rose-200) */
+  --acc-teal: #0d9488;           /* (dark: teal-400) */
+  --acc-purple: #9333ea;         /* (dark: purple-400) */
+  --acc-blue: #2563eb;           /* (dark: blue-400) */
+
+  /* Logo tile gradient (drawn with var() stops in Logo.tsx) */
+  --logo-bg-0: #fffdfa;
+  --logo-bg-1: #f0ece4;
+  --logo-bg-2: #e8e2d8;
+}
+
+.dark {
+  color-scheme: dark;
+
+  /* Neutrals — dark theme, warm charcoal (stone-tinted instead of blue-cool
+     zinc): easier on the eyes at night, same lightness levels as before */
+  --app: #121110;
+  --panel: #1b1917;
+  --well: #100e0d;
+  --chip: #292524;
+  --chip-strong: #57534e;
+  --edge: #2b2824;
+  --edge-strong: #44403c;
+  --ink: #f5f3ee;
+  --ink2: #e7e5e1;
+  --ink3: #d6d3cd;
+  --ink4: #a8a29e;
+  --ink5: #78716c;
+  --ink6: #57534e;
+  --ink-bright: #ffffff;
+
+  /* Accent text — original pale shades for dark surfaces */
+  --acc-emerald: #34d399;
+  --acc-emerald-soft: #6ee7b7;
+  --acc-emerald-strong: #a7f3d0;
+  --acc-sky: #38bdf8;
+  --acc-sky-soft: #7dd3fc;
+  --acc-sky-strong: #e0f2fe;
+  --acc-amber: #fbbf24;
+  --acc-amber-soft: #fcd34d;
+  --acc-amber-strong: #fef3c7;
+  --acc-rose: #fb7185;
+  --acc-rose-soft: #fda4af;
+  --acc-rose-strong: #fecdd3;
+  --acc-teal: #2dd4bf;
+  --acc-purple: #c084fc;
+  --acc-blue: #60a5fa;
+
+  /* Logo tile gradient */
+  --logo-bg-0: #12211d;
+  --logo-bg-1: #0d1514;
+  --logo-bg-2: #090c0b;
 }
 
 @theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
+  --color-app: var(--app);
+  --color-panel: var(--panel);
+  --color-well: var(--well);
+  --color-chip: var(--chip);
+  --color-chip-strong: var(--chip-strong);
+  --color-edge: var(--edge);
+  --color-edge-strong: var(--edge-strong);
+  --color-ink: var(--ink);
+  --color-ink2: var(--ink2);
+  --color-ink3: var(--ink3);
+  --color-ink4: var(--ink4);
+  --color-ink5: var(--ink5);
+  --color-ink6: var(--ink6);
+  --color-ink-bright: var(--ink-bright);
+  --color-acc-emerald: var(--acc-emerald);
+  --color-acc-emerald-soft: var(--acc-emerald-soft);
+  --color-acc-emerald-strong: var(--acc-emerald-strong);
+  --color-acc-sky: var(--acc-sky);
+  --color-acc-sky-soft: var(--acc-sky-soft);
+  --color-acc-sky-strong: var(--acc-sky-strong);
+  --color-acc-amber: var(--acc-amber);
+  --color-acc-amber-soft: var(--acc-amber-soft);
+  --color-acc-amber-strong: var(--acc-amber-strong);
+  --color-acc-rose: var(--acc-rose);
+  --color-acc-rose-soft: var(--acc-rose-soft);
+  --color-acc-rose-strong: var(--acc-rose-strong);
+  --color-acc-teal: var(--acc-teal);
+  --color-acc-purple: var(--acc-purple);
+  --color-acc-blue: var(--acc-blue);
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
-}
-
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
 }

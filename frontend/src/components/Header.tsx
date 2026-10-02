@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { RefreshCw, Cpu, Wifi, Volume2, VolumeX, Bell, BellOff } from 'lucide-react';
+import { RefreshCw, Cpu, Wifi, Volume2, VolumeX, Bell, BellOff, Sun, Moon } from 'lucide-react';
 import { Logo } from './Logo';
 
 interface HeaderProps {
@@ -36,22 +36,22 @@ export function Header({
   const isNotifGranted = notificationPermission === 'granted';
 
   return (
-    <header className="border-b border-zinc-800/80 bg-zinc-900/60 backdrop-blur-md sticky top-0 z-30">
+    <header className="border-b border-edge/80 bg-panel/60 backdrop-blur-md sticky top-0 z-30">
       <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3.5 flex flex-wrap items-center justify-between gap-4">
         {/* Brand / Logo */}
         <div className="flex items-center gap-3 group">
           <Logo size="md" />
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-lg font-semibold tracking-tight text-white group-hover:text-emerald-300 transition-colors">
+              <h1 className="text-lg font-semibold tracking-tight text-ink-bright group-hover:text-acc-emerald-soft transition-colors">
                 Sitting Time Tracker
               </h1>
-              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 text-acc-emerald border border-emerald-500/20">
                 <Wifi className="w-3 h-3 mr-1" />
                 IoT Live
               </span>
             </div>
-            <p className="text-xs text-zinc-400">
+            <p className="text-xs text-ink4">
               ESP8266 + HC-SR04 Ultrasonic Telemetry
             </p>
           </div>
@@ -65,8 +65,8 @@ export function Header({
             onClick={onRequestNotificationPermission}
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-all active:scale-[0.96] ${
               isNotifGranted
-                ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30'
-                : 'bg-amber-500/15 text-amber-200 border-amber-500/40 hover:bg-amber-500/25 animate-pulse'
+                ? 'bg-emerald-500/10 text-acc-emerald-soft border-emerald-500/30'
+                : 'bg-amber-500/15 text-acc-amber-strong border-amber-500/40 hover:bg-amber-500/25 animate-pulse'
             }`}
             title={
               isNotifGranted
@@ -76,12 +76,12 @@ export function Header({
           >
             {isNotifGranted ? (
               <>
-                <Bell className="w-3.5 h-3.5 text-emerald-400" />
+                <Bell className="w-3.5 h-3.5 text-acc-emerald" />
                 <span>Alerts On</span>
               </>
             ) : (
               <>
-                <BellOff className="w-3.5 h-3.5 text-amber-400" />
+                <BellOff className="w-3.5 h-3.5 text-acc-amber" />
                 <span>Enable Alerts</span>
               </>
             )}
@@ -93,19 +93,19 @@ export function Header({
             onClick={onToggleSound}
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors active:scale-[0.96] ${
               soundEnabled
-                ? 'bg-emerald-500/10 text-emerald-300 border-emerald-500/30 hover:bg-emerald-500/20'
-                : 'bg-zinc-900 text-zinc-500 border-zinc-800 hover:text-zinc-400'
+                ? 'bg-emerald-500/10 text-acc-emerald-soft border-emerald-500/30 hover:bg-emerald-500/20'
+                : 'bg-panel text-ink5 border-edge hover:text-ink4'
             }`}
             title={soundEnabled ? 'Chime sound enabled (plays in foreground & background tabs)' : 'Sound muted'}
           >
             {soundEnabled ? (
               <>
-                <Volume2 className="w-3.5 h-3.5 text-emerald-400" />
+                <Volume2 className="w-3.5 h-3.5 text-acc-emerald" />
                 <span>Audio On</span>
               </>
             ) : (
               <>
-                <VolumeX className="w-3.5 h-3.5 text-zinc-500" />
+                <VolumeX className="w-3.5 h-3.5 text-ink5" />
                 <span>Muted</span>
               </>
             )}
@@ -117,17 +117,17 @@ export function Header({
             onClick={() => setIsPolling(!isPolling)}
             className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium border transition-colors active:scale-[0.96] ${
               isPolling
-                ? 'bg-zinc-800/80 text-zinc-300 border-zinc-700 hover:bg-zinc-700/80'
-                : 'bg-zinc-900 text-zinc-500 border-zinc-800 hover:text-zinc-400'
+                ? 'bg-chip/80 text-ink3 border-edge-strong hover:bg-edge-strong/80'
+                : 'bg-panel text-ink5 border-edge hover:text-ink4'
             }`}
-            title="Toggle background auto-sync every 4 seconds"
+            title="Live distance telemetry streams every 2.5 seconds"
           >
             <span
               className={`w-2 h-2 rounded-full ${
-                isPolling ? 'bg-emerald-400 animate-pulse' : 'bg-zinc-600'
+                isPolling ? 'bg-emerald-400 animate-pulse' : 'bg-chip-strong'
               }`}
             />
-            {isPolling ? 'Live Auto-Sync (4s)' : 'Auto-Sync Paused'}
+            {isPolling ? 'Live Auto-Sync (2.5s)' : 'Auto-Sync Paused'}
           </button>
 
           {/* Manual Refresh */}
@@ -135,14 +135,14 @@ export function Header({
             type="button"
             onClick={onRefresh}
             disabled={isLoading}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800/90 text-zinc-200 border border-zinc-700/80 hover:bg-zinc-700/90 transition-colors disabled:opacity-50 active:scale-[0.96]"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-chip/90 text-ink2 border border-edge-strong/80 hover:bg-edge-strong/90 transition-colors disabled:opacity-50 active:scale-[0.96]"
             title="Refresh now"
           >
             <RefreshCw
-              className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-emerald-400' : ''}`}
+              className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin text-acc-emerald' : ''}`}
             />
             <span>Sync</span>
-            <span className="text-[10px] text-zinc-500 font-mono hidden md:inline">
+            <span className="text-[10px] text-ink5 font-mono hidden md:inline">
               ({formattedSyncTime})
             </span>
           </button>
@@ -151,10 +151,24 @@ export function Header({
           <button
             type="button"
             onClick={onOpenHardwareGuide}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-zinc-800/90 text-zinc-300 border border-zinc-700/80 hover:bg-zinc-700/90 transition-colors active:scale-[0.96]"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium bg-chip/90 text-ink3 border border-edge-strong/80 hover:bg-edge-strong/90 transition-colors active:scale-[0.96]"
           >
-            <Cpu className="w-3.5 h-3.5 text-teal-400" />
+            <Cpu className="w-3.5 h-3.5 text-acc-teal" />
             <span>ESP8266 Guide</span>
+          </button>
+
+          {/* Theme toggle — dark ⇄ light (persisted, see layout bootstrap) */}
+          <button
+            type="button"
+            onClick={() => {
+              const isDark = document.documentElement.classList.toggle('dark');
+              try { localStorage.setItem('theme', isDark ? 'dark' : 'light'); } catch { /* storage unavailable */ }
+            }}
+            className="inline-flex items-center justify-center w-8 h-8 rounded-lg bg-chip/90 text-ink4 border border-edge-strong/80 hover:bg-edge-strong/90 hover:text-ink2 transition-colors active:scale-[0.96]"
+            title="Toggle light / dark theme"
+          >
+            <Sun className="w-3.5 h-3.5 hidden dark:block" />
+            <Moon className="w-3.5 h-3.5 dark:hidden" />
           </button>
         </div>
       </div>

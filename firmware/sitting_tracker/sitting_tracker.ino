@@ -19,8 +19,8 @@
  *                                          GND
  *
  * Logic & Timing Specifications (posture tracking):
- *   - RELAX_ENTER_CM     = 4.5 cm (distance < threshold is relaxing)
- *   - ATTENTIVE_ENTER_CM = 5 cm   (4.5–5 cm is a deadband: hold previous state)
+ *   - RELAX_ENTER_CM     = 8 cm   (distance < threshold is relaxing)
+ *   - ATTENTIVE_ENTER_CM = 8.5 cm (8–8.5 cm is a deadband: hold previous state)
  *   - OCCUPANCY_LIMIT_CM = 45 cm  (distance <= threshold is occupied)
  *   - OCCUPIED_CONFIRM   = 2000 ms continuous detection to confirm relaxing/attentive
  *   - VACANT_CONFIRM     = 5000 ms continuous detection to confirm vacant
@@ -147,22 +147,22 @@ const int PIN_TRIG = 12; // D6
 const int PIN_ECHO = 14; // D5
 
 // Posture Detection Thresholds
-//   distance <  4.5  → RELAXING
-//   4.5 … 5          → deadband: keep the previous state (hysteresis, so
-//                      readings hovering at the boundary don't flap)
-//   5 < distance ≤ 45 → ATTENTIVE
+//   distance <  8      → RELAXING
+//   8 … 8.5            → deadband: keep the previous state (hysteresis, so
+//                        readings hovering at the boundary don't flap)
+//   8.5 < distance ≤ 45 → ATTENTIVE
 //   distance > 45 or invalid → VACANT (desk unoccupied)
-const float RELAX_ENTER_CM          = 4.5;   // Distance < 4.5 cm is relaxing
-const float ATTENTIVE_ENTER_CM      = 5.0;   // Distance > 5 cm (and <= 45) is attentive
+const float RELAX_ENTER_CM          = 8.0;   // Distance < 8 cm is relaxing
+const float ATTENTIVE_ENTER_CM      = 8.5;   // Distance > 8.5 cm (and <= 45) is attentive
 const float OCCUPANCY_LIMIT_CM      = 45.0;  // Distance > 45 cm is vacant
 const unsigned long OCCUPIED_CONFIRM = 2000; // 2000 ms continuous to confirm relaxing/attentive
 const unsigned long VACANT_CONFIRM   = 5000; // 5000 ms continuous to confirm vacant
 const unsigned long SENSOR_INTERVAL = 700;   // 700 ms between sensor readings
 
-// Live distance telemetry: send the latest reading to the dashboard every 5s
+// Live distance telemetry: send the latest reading to the dashboard every 2.5s
 // over the WebSocket ({"type":"sensor",...}). The backend caches it in memory
 // and pushes it to the dashboard via SSE — it is never stored in the database.
-const unsigned long SENSOR_SEND_INTERVAL_MS = 5000;
+const unsigned long SENSOR_SEND_INTERVAL_MS = 2500;
 
 // WebSocket keepalive: protocol-level ping every 15s, pong must arrive within
 // 3s; 2 missed pongs ⇒ the library drops the TCP connection and reconnects.
@@ -274,8 +274,8 @@ void setup() {
   Serial.print(initialDistance);
   Serial.println(F(" cm"));
 
-  // Same classification as loop(): < 4.5 relaxing, 4.5–5 deadband (treat as
-  // attentive on boot), 5–45 attentive, > 45 / invalid vacant
+  // Same classification as loop(): < 8 relaxing, 8–8.5 deadband (treat as
+  // attentive on boot), 8.5–45 attentive, > 45 / invalid vacant
   if (initialDistance > 0 && initialDistance <= OCCUPANCY_LIMIT_CM) {
     potentialState = (initialDistance < RELAX_ENTER_CM) ? STATE_RELAXING : STATE_ATTENTIVE;
   } else {
@@ -324,11 +324,11 @@ void loop() {
     Serial.print(F(" | Current: "));
     Serial.print(stateName(currentState));
 
-    // Determine instantaneous posture (with 4.5–5 cm hysteresis deadband):
-    //   Valid distance < 4.5 cm            → relaxing
-    //   Distance in the 4.5–5 cm deadband  → hold the current state (a vacant
+    // Determine instantaneous posture (with 8–8.5 cm hysteresis deadband):
+    //   Valid distance < 8 cm              → relaxing
+    //   Distance in the 8–8.5 cm deadband  → hold the current state (a vacant
     //                                        device reads the deadband as attentive)
-    //   5 cm < distance <= 45 cm           → attentive
+    //   8.5 cm < distance <= 45 cm         → attentive
     //   Distance > 45 cm or negative (no echo / out of range) → vacant
     State measuredState;
     if (distance <= 0 || distance > OCCUPANCY_LIMIT_CM) {

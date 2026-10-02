@@ -11,38 +11,38 @@ interface SessionHistoryProps {
 
 export function SessionHistory({ sessions }: SessionHistoryProps) {
   return (
-    <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-6 backdrop-blur-sm shadow-md">
-      <div className="flex items-center justify-between pb-5 border-b border-zinc-800/80">
+    <div className="rounded-2xl border border-edge bg-panel/50 p-6 backdrop-blur-sm shadow-md">
+      <div className="flex items-center justify-between pb-5 border-b border-edge/80">
         <div className="flex items-center gap-2.5">
-          <div className="p-2 rounded-xl bg-teal-500/10 text-teal-400">
+          <div className="p-2 rounded-xl bg-teal-500/10 text-acc-teal">
             <History className="w-5 h-5" />
           </div>
           <div>
-            <h3 className="text-base font-semibold text-white">Today&apos;s Session Log</h3>
-            <p className="text-xs text-zinc-400">Chronological history of sitting periods today</p>
+            <h3 className="text-base font-semibold text-ink-bright">Today&apos;s Session Log</h3>
+            <p className="text-xs text-ink4">Chronological history of sitting periods today</p>
           </div>
         </div>
 
-        <span className="text-xs font-mono text-zinc-400 px-2.5 py-1 rounded-full bg-zinc-800 border border-zinc-700/60">
+        <span className="text-xs font-mono text-ink4 px-2.5 py-1 rounded-full bg-chip border border-edge-strong/60">
           {sessions.length} {sessions.length === 1 ? 'Session' : 'Sessions'}
         </span>
       </div>
 
       {sessions.length === 0 ? (
         <div className="py-12 text-center">
-          <div className="inline-flex p-3 rounded-2xl bg-zinc-800/60 text-zinc-500 mb-3">
+          <div className="inline-flex p-3 rounded-2xl bg-chip/60 text-ink5 mb-3">
             <Clock className="w-8 h-8" />
           </div>
-          <h4 className="text-sm font-medium text-zinc-300">No sessions recorded yet today</h4>
-          <p className="text-xs text-zinc-500 max-w-sm mx-auto mt-1">
+          <h4 className="text-sm font-medium text-ink3">No sessions recorded yet today</h4>
+          <p className="text-xs text-ink5 max-w-sm mx-auto mt-1">
             When you sit down at your desk, the HC-SR04 sensor will automatically record your session after 2 seconds.
           </p>
         </div>
       ) : (
-        <div className="mt-4 max-h-[380px] overflow-y-auto overflow-x-auto pr-1 rounded-xl border border-zinc-800/80 bg-zinc-950/40">
+        <div className="mt-4 max-h-[380px] overflow-y-auto overflow-x-auto pr-1 rounded-xl border border-edge/80 bg-well/40">
           <table className="w-full text-left text-xs">
-            <thead className="sticky top-0 bg-zinc-900/95 backdrop-blur-md z-10 border-b border-zinc-800/90 shadow-sm">
-              <tr className="text-zinc-400 font-medium">
+            <thead className="sticky top-0 bg-panel/95 backdrop-blur-md z-10 border-b border-edge/90 shadow-sm">
+              <tr className="text-ink4 font-medium">
                 <th className="py-3 px-3">Status</th>
                 <th className="py-3 px-3">Start Time</th>
                 <th className="py-3 px-3">End Time</th>
@@ -50,7 +50,7 @@ export function SessionHistory({ sessions }: SessionHistoryProps) {
                 <th className="py-3 px-3 text-right">Duration</th>
               </tr>
             </thead>
-            <tbody className="divide-y divide-zinc-800/40 font-mono">
+            <tbody className="divide-y divide-edge/40 font-mono">
               {sessions.map((session, index) => {
                 const isActive = session.ended_at === null;
                 const durationSec = session.duration_seconds ?? 0;
@@ -73,32 +73,32 @@ export function SessionHistory({ sessions }: SessionHistoryProps) {
                 return (
                   <tr
                     key={session.id || index}
-                    className="hover:bg-zinc-800/30 transition-colors group"
+                    className="hover:bg-chip/30 transition-colors group"
                   >
                     {/* Status badge */}
                     <td className="py-3.5 px-3">
                       {isActive ? (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-sans font-medium bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                          <Radio className="w-3 h-3 animate-pulse text-emerald-400" />
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-sans font-medium bg-emerald-500/15 text-acc-emerald-soft border border-emerald-500/30">
+                          <Radio className="w-3 h-3 animate-pulse text-acc-emerald" />
                           <span>Active Now</span>
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-sans font-medium bg-zinc-800 text-zinc-400 border border-zinc-700/60">
-                          <CheckCircle2 className="w-3 h-3 text-zinc-400" />
+                        <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-sans font-medium bg-chip text-ink4 border border-edge-strong/60">
+                          <CheckCircle2 className="w-3 h-3 text-ink4" />
                           <span>Completed</span>
                         </span>
                       )}
                     </td>
 
                     {/* Start Time */}
-                    <td className="py-3.5 px-3 text-zinc-200">
+                    <td className="py-3.5 px-3 text-ink2">
                       {formatTimeOnly(session.started_at)}
                     </td>
 
                     {/* End Time */}
-                    <td className="py-3.5 px-3 text-zinc-400">
+                    <td className="py-3.5 px-3 text-ink4">
                       {isActive ? (
-                        <span className="text-emerald-400 italic">In progress...</span>
+                        <span className="text-acc-emerald italic">In progress...</span>
                       ) : (
                         formatTimeOnly(session.ended_at!)
                       )}
@@ -107,17 +107,17 @@ export function SessionHistory({ sessions }: SessionHistoryProps) {
                     {/* Posture Split */}
                     <td className="py-3.5 px-3 whitespace-nowrap">
                       {!hasSplit ? (
-                        <span className="text-zinc-600">—</span>
+                        <span className="text-ink6">—</span>
                       ) : (
                         <div className="flex flex-col gap-0.5">
                           {attentiveSec > 0 && (
-                            <span className="inline-flex items-center gap-1.5 text-emerald-300">
+                            <span className="inline-flex items-center gap-1.5 text-acc-emerald-soft">
                               <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
                               A&nbsp;{formatFriendlyDuration(attentiveSec)}
                             </span>
                           )}
                           {relaxSec > 0 && (
-                            <span className="inline-flex items-center gap-1.5 text-sky-300">
+                            <span className="inline-flex items-center gap-1.5 text-acc-sky-soft">
                               <span className="w-1.5 h-1.5 rounded-full bg-sky-400 shrink-0" />
                               R&nbsp;{formatFriendlyDuration(relaxSec)}
                             </span>
@@ -129,13 +129,13 @@ export function SessionHistory({ sessions }: SessionHistoryProps) {
                     {/* Duration */}
                     <td className="py-3.5 px-3 text-right tabular-nums">
                       {isActive ? (
-                        <span className="text-emerald-400 font-bold">Counting...</span>
+                        <span className="text-acc-emerald font-bold">Counting...</span>
                       ) : (
                         <div className="flex flex-col items-end">
-                          <span className="font-bold text-zinc-100">
+                          <span className="font-bold text-ink">
                             {formatFriendlyDuration(durationSec)}
                           </span>
-                          <span className="text-[10px] text-zinc-500">
+                          <span className="text-[10px] text-ink5">
                             {formatHMS(durationSec)}
                           </span>
                         </div>

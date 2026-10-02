@@ -2,9 +2,9 @@
 -- Posture tracking: split each session into relaxing vs attentive time
 -- ==============================================================================
 -- Distance bands (classified in firmware, debounced):
---   < 4.5 cm            -> relaxing
---   4.5 - 5 cm          -> deadband, hold previous state
---   > 5 cm  and <= 45   -> attentive
+--   < 8 cm              -> relaxing
+--   8 - 8.5 cm          -> deadband, hold previous state
+--   > 8.5 cm and <= 45  -> attentive
 --   > 45 cm / invalid   -> vacant (session closes as before)
 --
 -- posture_state / posture_changed_at describe the CURRENT stretch inside the

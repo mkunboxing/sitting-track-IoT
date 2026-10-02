@@ -28,25 +28,25 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
   })();
 
   return (
-    <div className="rounded-2xl border border-zinc-800 bg-zinc-900/50 p-5 backdrop-blur-sm shadow-md">
+    <div className="rounded-2xl border border-edge bg-panel/50 p-5 backdrop-blur-sm shadow-md">
       {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-5 pb-4 border-b border-zinc-800/80">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-5 pb-4 border-b border-edge/80">
         <div className="flex items-center gap-2.5">
-          <div className="p-2 rounded-xl bg-purple-500/10 text-purple-400">
+          <div className="p-2 rounded-xl bg-purple-500/10 text-acc-purple">
             <BarChart3 className="w-5 h-5" />
           </div>
           <div>
-            <h3 className="text-sm font-semibold text-white">Weekly Sitting Activity</h3>
-            <p className="text-[11px] text-zinc-400">Daily sitting duration comparison</p>
+            <h3 className="text-sm font-semibold text-ink-bright">Weekly Sitting Activity</h3>
+            <p className="text-[11px] text-ink4">Daily sitting duration comparison</p>
           </div>
         </div>
         <div className="flex items-center gap-2 text-xs font-mono flex-wrap">
-          <span className="px-2.5 py-1 rounded-lg bg-zinc-800 border border-zinc-700/60 text-zinc-300 whitespace-nowrap">
-            Week: <strong className="text-white">{formatFriendlyDuration(totalWeeklySeconds)}</strong>
-            <span className="text-zinc-500 ml-1">({totalWeeklySessions}s)</span>
+          <span className="px-2.5 py-1 rounded-lg bg-chip border border-edge-strong/60 text-ink3 whitespace-nowrap">
+            Week: <strong className="text-ink-bright">{formatFriendlyDuration(totalWeeklySeconds)}</strong>
+            <span className="text-ink5 ml-1">({totalWeeklySessions}s)</span>
           </span>
-          <span className="hidden sm:inline text-zinc-500 text-[11px]">
-            Avg: <strong className="text-zinc-300">{formatFriendlyDuration(averageDailySeconds)}/day</strong>
+          <span className="hidden sm:inline text-ink5 text-[11px]">
+            Avg: <strong className="text-ink3">{formatFriendlyDuration(averageDailySeconds)}/day</strong>
           </span>
         </div>
       </div>
@@ -69,7 +69,7 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
             <div key={day.date} className="flex-1 flex flex-col items-center gap-1.5 group h-full">
               {/* Duration label above bar */}
               <span className={`text-[9px] sm:text-[10px] font-mono tabular-nums transition-colors ${
-                isToday ? 'text-emerald-400 font-bold' : hasData ? 'text-zinc-300' : 'text-zinc-600'
+                isToday ? 'text-acc-emerald font-bold' : hasData ? 'text-ink3' : 'text-ink6'
               }`}>
                 {hasData ? formatFriendlyDuration(day.totalSeconds) : '—'}
               </span>
@@ -77,22 +77,22 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
               {/* Bar track */}
               <div className="flex-1 w-full flex flex-col justify-end relative">
                 {/* Tooltip */}
-                <div className="absolute -top-12 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none z-30 whitespace-nowrap bg-zinc-950 border border-zinc-700 px-2 py-1 rounded-lg shadow-xl text-[11px] font-mono">
-                  <p className="font-semibold text-white">{day.dayName} {day.date.slice(5)} · {formatFriendlyDuration(day.totalSeconds)}</p>
+                <div className="absolute -top-12 left-1/2 -translate-x-1/2 opacity-0 group-hover:opacity-100 transition-opacity duration-150 pointer-events-none z-30 whitespace-nowrap bg-app border border-edge-strong px-2 py-1 rounded-lg shadow-xl text-[11px] font-mono">
+                  <p className="font-semibold text-ink-bright">{day.dayName} {day.date.slice(5)} · {formatFriendlyDuration(day.totalSeconds)}</p>
                   {hasPostureData && (
                     <>
-                      <p className="text-emerald-400">A {formatFriendlyDuration(day.attentiveSeconds)}</p>
-                      <p className="text-sky-400">R {formatFriendlyDuration(day.relaxSeconds)}</p>
+                      <p className="text-acc-emerald">A {formatFriendlyDuration(day.attentiveSeconds)}</p>
+                      <p className="text-acc-sky">R {formatFriendlyDuration(day.relaxSeconds)}</p>
                     </>
                   )}
                   {day.unclassifiedSeconds > 0 && (
-                    <p className="text-zinc-400">Untracked {formatFriendlyDuration(day.unclassifiedSeconds)}</p>
+                    <p className="text-ink4">Untracked {formatFriendlyDuration(day.unclassifiedSeconds)}</p>
                   )}
-                  <p className="text-zinc-400">{day.sessionCount} sess</p>
+                  <p className="text-ink4">{day.sessionCount} sess</p>
                 </div>
 
                 {/* Empty track */}
-                <div className="absolute inset-0 rounded-lg bg-zinc-800/40 border border-zinc-800/60 group-hover:border-zinc-700 transition-colors" />
+                <div className="absolute inset-0 rounded-lg bg-chip/40 border border-edge/60 group-hover:border-edge-strong transition-colors" />
 
                 {/* Filled portion — stacked posture segments */}
                 {hasData && (
@@ -114,7 +114,7 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
                     )}
                     {day.unclassifiedSeconds > 0 && (
                       <div
-                        className="w-full bg-zinc-600/60"
+                        className="w-full bg-chip-strong/60"
                         style={{ height: `${segShare(day.unclassifiedSeconds)}%` }}
                       />
                     )}
@@ -128,11 +128,11 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
               {/* Day name + sessions */}
               <div className="text-center shrink-0">
                 <span className={`text-[10px] sm:text-xs font-semibold block ${
-                  isToday ? 'text-emerald-400' : 'text-zinc-400 group-hover:text-zinc-200'
+                  isToday ? 'text-acc-emerald' : 'text-ink4 group-hover:text-ink2'
                 }`}>
                   {day.dayName}
                 </span>
-                <span className="text-[9px] text-zinc-600 font-mono block">
+                <span className="text-[9px] text-ink6 font-mono block">
                   {day.sessionCount}s
                 </span>
               </div>
@@ -142,11 +142,11 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
       </div>
 
       {/* Footer */}
-      <div className="mt-4 pt-3 border-t border-zinc-800/60 flex flex-wrap items-center justify-between gap-2 text-[11px] text-zinc-400">
+      <div className="mt-4 pt-3 border-t border-edge/60 flex flex-wrap items-center justify-between gap-2 text-[11px] text-ink4">
         <div className="flex items-center gap-1.5">
-          <Flame className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+          <Flame className="w-3.5 h-3.5 text-acc-amber shrink-0" />
           <span>
-            Best: <strong className="text-zinc-200">{bestDay?.dayName || 'N/A'}</strong>{' '}
+            Best: <strong className="text-ink2">{bestDay?.dayName || 'N/A'}</strong>{' '}
             ({formatFriendlyDuration(bestDay?.totalSeconds || 0)})
           </span>
         </div>
@@ -160,12 +160,12 @@ export function WeeklyChart({ weeklyStats }: WeeklyChartProps) {
             Relaxing
           </span>
           <span className="inline-flex items-center gap-1.5">
-            <span className="w-2 h-2 rounded-sm bg-zinc-600/60 shrink-0" />
+            <span className="w-2 h-2 rounded-sm bg-chip-strong/60 shrink-0" />
             Pre-posture
           </span>
         </div>
         <div className="flex items-center gap-1.5">
-          <TrendingUp className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+          <TrendingUp className="w-3.5 h-3.5 text-acc-teal shrink-0" />
           <span>Target: &lt; 8h / day</span>
         </div>
       </div>

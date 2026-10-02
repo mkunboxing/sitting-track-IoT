@@ -34,36 +34,36 @@ export function Logo({
       <defs>
         {/* Background Dark Gradient */}
         <linearGradient id="logoBg" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#0f2420" />
-          <stop offset="50%" stop-color="#091415" />
-          <stop offset="100%" stop-color="#050a0b" />
+          <stop offset="0%" stopColor="var(--logo-bg-0)" />
+          <stop offset="50%" stopColor="var(--logo-bg-1)" />
+          <stop offset="100%" stopColor="var(--logo-bg-2)" />
         </linearGradient>
 
         {/* Ambient Ring Border Gradient */}
         <linearGradient id="logoBorder" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#34d399" stop-opacity="0.8" />
-          <stop offset="50%" stop-color="#14b8a6" stop-opacity="0.3" />
-          <stop offset="100%" stop-color="#06b6d4" stop-opacity="0.6" />
+          <stop offset="0%" stopColor="#34d399" stopOpacity="0.8" />
+          <stop offset="50%" stopColor="#14b8a6" stopOpacity="0.3" />
+          <stop offset="100%" stopColor="#06b6d4" stopOpacity="0.6" />
         </linearGradient>
 
         {/* Chair Primary Emerald / Teal Gradient */}
         <linearGradient id="chairPrimary" x1="20%" y1="0%" x2="80%" y2="100%">
-          <stop offset="0%" stop-color="#34d399" />
-          <stop offset="50%" stop-color="#10b981" />
-          <stop offset="100%" stop-color="#0d9488" />
+          <stop offset="0%" stopColor="#34d399" />
+          <stop offset="50%" stopColor="#10b981" />
+          <stop offset="100%" stopColor="#0d9488" />
         </linearGradient>
 
         {/* Telemetry Ultrasonic Arcs Gradient */}
         <linearGradient id="telemetryArcs" x1="0%" y1="30%" x2="100%" y2="70%">
-          <stop offset="0%" stop-color="#2dd4bf" />
-          <stop offset="50%" stop-color="#38bdf8" />
-          <stop offset="100%" stop-color="#818cf8" />
+          <stop offset="0%" stopColor="#2dd4bf" />
+          <stop offset="50%" stopColor="#38bdf8" />
+          <stop offset="100%" stopColor="#818cf8" />
         </linearGradient>
 
         {/* Subtle Ambient Radial Glow */}
         <radialGradient id="centerGlow" cx="50%" cy="50%" r="50%">
-          <stop offset="0%" stop-color="#10b981" stop-opacity="0.35" />
-          <stop offset="100%" stop-color="#10b981" stop-opacity="0" />
+          <stop offset="0%" stopColor="#10b981" stopOpacity="0.35" />
+          <stop offset="100%" stopColor="#10b981" stopOpacity="0" />
         </radialGradient>
       </defs>
 
@@ -168,7 +168,7 @@ export function Logo({
         {animated && (
           <span className="absolute -top-0.5 -right-0.5 flex h-2.5 w-2.5 pointer-events-none">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500 ring-2 ring-zinc-900" />
+            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500 ring-2 ring-white dark:ring-zinc-900" />
           </span>
         )}
       </div>
@@ -182,20 +182,20 @@ export function Logo({
         {animated && (
           <span className="absolute -top-0.5 -right-0.5 flex h-2.5 w-2.5 pointer-events-none">
             <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75" />
-            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500 ring-2 ring-zinc-900" />
+            <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500 ring-2 ring-white dark:ring-zinc-900" />
           </span>
         )}
       </div>
       <div>
         <div className="flex items-center gap-2">
-          <span className="text-lg font-bold tracking-tight text-white group-hover:text-emerald-300 transition-colors">
+          <span className="text-lg font-bold tracking-tight text-ink-bright group-hover:text-acc-emerald-soft transition-colors">
             Sitting Time Tracker
           </span>
-          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+          <span className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold bg-emerald-500/10 text-acc-emerald border border-emerald-500/20">
             IoT
           </span>
         </div>
-        <p className="text-xs text-zinc-400">
+        <p className="text-xs text-ink4">
           Smart Ergonomics &amp; Ultrasonic Telemetry
         </p>
       </div>

@@ -244,9 +244,9 @@ async function main() {
     d.authenticate();
     if (!(await d.waitAuth())) { console.error('FAILED: not authenticated'); process.exit(1); }
     console.log('Streaming sensor readings every 2s for 10s (watch the dashboard distance / SSE stream)...');
-    // Covers each posture band: relaxing (<4.5), attentive (5–45), deadband
-    // (4.5–5), vacant (>45), invalid (sensor timeout)
-    const readings = [3.2, 20.0, 4.7, 60.0, -1.0];
+    // Covers each posture band: relaxing (<8), attentive (8.5–45), deadband
+    // (8–8.5), vacant (>45), invalid (sensor timeout)
+    const readings = [5.0, 20.0, 8.2, 60.0, -1.0];
     for (let i = 0; i < 5; i++) {
       d.send({ type: 'sensor', deviceId: d.id, distance: readings[i] });
       await sleep(2000);
