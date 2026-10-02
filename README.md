@@ -6,7 +6,7 @@ The project is split into two apps:
 
 | App | Location | Role |
 | :--- | :--- | :--- |
-| **Frontend** | repo root | Next.js dashboard (static UI, calls the API server) |
+| **Frontend** | [`frontend/`](./frontend) | Next.js dashboard (static UI, calls the API server) |
 | **Backend** | [`backend/`](./backend) | Express (TypeScript) API + device WebSocket + SSE streaming + Supabase access |
 
 ---
@@ -162,7 +162,7 @@ PORT=4000
 CORS_ORIGIN=http://localhost:3000
 ```
 
-### Frontend — `.env.local` (repo root)
+### Frontend — `frontend/.env.local`
 
 ```env
 # Base URL of the Express backend (empty = same origin)
@@ -182,11 +182,12 @@ Run both processes in separate terminals:
 
 ```bash
 # Terminal 1 — Express backend (http://localhost:4000)
-cd server
+cd backend
 npm install
 npm run dev
 
 # Terminal 2 — Next.js frontend (http://localhost:3000)
+cd frontend
 npm install
 npm run dev
 ```
@@ -195,7 +196,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser. The dashboa
 
 ### Deploying
 
-- **Frontend (repo root)** — deploys to Vercel as before. Set the `NEXT_PUBLIC_API_URL` environment variable to the public URL of your Express server (it is inlined into the client bundle at build time).
+- **Frontend (`frontend/`)** — deploys to Vercel. In the Vercel project settings, set **Root Directory = `frontend`** (Vercel auto-detects Next.js from there), and set the `NEXT_PUBLIC_API_URL` environment variable to the public URL of your Express server (it is inlined into the client bundle at build time), e.g. your Cloud Run URL.
 - **Backend (`backend/`)** — needs an **always-on host with WebSocket support** (Railway, Render, Fly.io, or a VPS all work; serverless platforms like Vercel Functions do **not** — they will not keep WebSocket or SSE connections open). Build with `npm run build`, start with `npm start`, and set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEVICE_TOKEN`, `PORT`, and `CORS_ORIGIN` there — `CORS_ORIGIN=*` allows any origin (easy for dev), or list explicit origins comma-separated, e.g. `http://localhost:3000,https://smart-tracking.vercel.app` (recommended for production). The device WebSocket and the HTTP API share one port — no extra port to open. If you put Nginx in front, forward the upgrade headers:
   ```nginx
   location / {
