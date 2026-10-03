@@ -108,7 +108,7 @@ const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
 //   http://192.168.1.12:4000/api/sitting/heartbeat   → USE_TLS = false
 //     (find your computer's IP: macOS Wi-Fi → Option-click the icon)
 // ---------------------------------------------------------------------------
-const char*    API_HOST = "sitting-track-iot-1014206902177.asia-south2.run.app";
+const char*    API_HOST = "sitting-track-iot.onrender.com";
 const uint16_t API_PORT = 443;                 // 443 for Cloud Run (https), 4000 for local dev
 const char*    API_PATH = "/api/sitting/heartbeat";
 const bool     USE_TLS  = true;                // true → https:// (Cloud Run); false → local dev
