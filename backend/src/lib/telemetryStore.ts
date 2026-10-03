@@ -125,6 +125,23 @@ export function shouldTouchHeartbeat(deviceId: string, minIntervalMs = 10_000): 
   return true;
 }
 
+/**
+ * Mark a device offline in the in-memory store — used by the MQTT subscriber
+ * when the broker delivers the device's LWT "offline" status (the device's
+ * TCP connection dropped without a clean disconnect). Same effect as the
+ * HTTP 30 s contact gap: the cached reading is dropped (the dashboard shows
+ * "waiting for sensor…") and the remembered state is cleared so the device's
+ * next snapshot is treated as a fresh transition. The active session, if
+ * any, is left for the existing /status stale-check to close at
+ * last-contact time — unchanged session behavior.
+ */
+export function markDeviceOffline(deviceId: string): void {
+  if (!readings.has(deviceId) && !lastKnownStates.has(deviceId)) return;
+  console.log(`[TELEMETRY] ${deviceId}: marked offline (MQTT LWT / broker status)`);
+  readings.delete(deviceId);
+  lastKnownStates.delete(deviceId);
+}
+
 /** Devices that posted a telemetry snapshot within the online window. */
 export function getOnlineDeviceIds(): string[] {
   const cutoff = Date.now() - DEVICE_ONLINE_WINDOW_MS;

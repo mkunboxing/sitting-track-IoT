@@ -8,16 +8,9 @@ import {
   setPosture,
   accumulatePosture,
   currentPostureStretchSeconds,
-  touchActiveSessionHeartbeat,
 } from '../lib/sessionService';
-import {
-  DEVICE_ONLINE_WINDOW_MS,
-  getLatestSensorReading,
-  getLastKnownState,
-  recordTelemetry,
-  setLastKnownState,
-  shouldTouchHeartbeat,
-} from '../lib/telemetryStore';
+import { DEVICE_ONLINE_WINDOW_MS, getLatestSensorReading } from '../lib/telemetryStore';
+import { parseTelemetryPayload, processDeviceTelemetry } from '../lib/telemetryProcessor';
 import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '../lib/timeUtils';
 import type { DashboardStatsResponse, DayStats, SittingSession } from '../types/sitting';
 
@@ -28,34 +21,6 @@ function singleQuery(value: unknown): string | null {
   if (typeof value === 'string') return value;
   if (Array.isArray(value) && typeof value[0] === 'string') return value[0];
   return null;
-}
-
-/**
- * How far a device-derived session timestamp may be backdated from server
- * "now". The normal flow only needs the confirmation windows (~5–12.5s);
- * the cap keeps a bogus/lost value from anchoring a session absurdly far in
- * the past (e.g. millis() corruption) — longer outages keep today's behavior
- * (session starts when contact resumes).
- */
-const MAX_FIRST_DETECTION_BACKDATE_MS = 300_000;
-
-/**
- * Convert the device's `stateForMs` (how long the reported state has been
- * continuously measured — i.e. when its confirmation window BEGAN) into an
- * absolute first-detection moment anchored to the server clock. Returns
- * undefined when absent (old firmware / heartbeat-only POST) so those flows
- * keep the previous server-"now" timing.
- *
- * `notBeforeMs` (used after a resumed contact gap) stops a device returning
- * still-sitting from backdating a new session into time already covered by
- * the session the stale-check just closed.
- */
-function firstDetectedAt(stateForMs: number | undefined, notBeforeMs: number | null): Date | undefined {
-  if (stateForMs === undefined) return undefined;
-  const nowMs = Date.now();
-  const candidate = nowMs - Math.min(stateForMs, MAX_FIRST_DETECTION_BACKDATE_MS);
-  const clamped = notBeforeMs !== null ? Math.max(candidate, notBeforeMs) : candidate;
-  return new Date(Math.min(clamped, nowMs));
 }
 
 /**
@@ -441,47 +406,32 @@ sittingRouter.post('/simulate', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// POST /heartbeat — device telemetry (replaces the old WebSocket gateway and
-// the legacy HTTP /start + /stop routes).
+// POST /heartbeat — device telemetry over HTTP (kept during the MQTT
+// migration alongside the EMQX Cloud subscriber in lib/mqttClient.ts).
 //
 // The ESP8266 POSTs a seating-state snapshot every 2.5s:
 //   Authorization: Bearer <DEVICE_TOKEN>
 //   { "deviceId": "sitting-tracker-01", "distance": 10.5,
 //     "state": "attentive", "timestamp": 1234567890 }
 //
-// Each request IS the device's last-contact/heartbeat signal:
-// 1. The reading is cached in memory (never persisted) for GET /status.
-// 2. The state snapshot is edge-detected against the device's last known
-//    state; only actual transitions call the shared sessionService, so
-//    manual dashboard controls are never overridden by unchanged snapshots
-//    and identical snapshots don't hit the DB every 2.5s.
-//    (The device debounce is the confirmation layer: it only reports sitting
-//    after 5s of continuous sitting and vacant after 10s of continuous
-//    vacant — see firmware/sitting_tracker/debounce.h — so snapshots
-//    arriving here are already-confirmed transitions.)
-//    - relaxing/attentive → setPosture (opens a session when vacant)
-//    - vacant             → closeActiveSession
-// 3. last_heartbeat_at is touched (throttled to one write per 10s, the same
-//    rate as the old WS ping loop) so the /status stale-check auto-closes the
-//    session — with ended_at = last contact — if snapshots stop arriving.
+// This route is now a thin HTTP adapter: auth (Bearer DEVICE_TOKEN) →
+// deviceId (advisory; defaults to "default") → parseTelemetryPayload (same
+// validation as the MQTT path) → processDeviceTelemetry — the shared
+// pipeline in lib/telemetryProcessor.ts that the MQTT subscriber feeds too.
+// There, each snapshot is: cached for /status (in-memory) → edge-detected
+// against the device's last known state → routed to the shared
+// sessionService only on actual transitions (relaxing/attentive → setPosture,
+// vacant → closeActiveSession, with session timing anchored to the
+// device-derived `stateForMs` first-detection moment) → last_heartbeat_at
+// touched (throttled to one write per 10s) so the /status stale-check keeps
+// working unchanged.
 //
-// All fields are optional (a bare heartbeat-only POST is still valid) and
+// Because identical snapshots are idempotent in the shared pipeline, it is
+// safe for the device to send the same snapshot over BOTH transports during
+// the migration — the second copy no-ops.
+//
 // `timestamp` is accepted but ignored: the server clock stays the source of
 // truth for all session timing.
-//
-// `stateForMs` (device-derived, optional) says how long the reported state has
-// been continuously measured — when its confirmation window BEGAN. On the
-// transition POSTs the route anchors session timing to that first-detection
-// moment instead of the arrival moment, so the firmware's 5 s sitting / 10 s
-// vacancy confirmation windows never inflate the recorded sitting duration:
-//   - sitting snapshot → setPosture/openSession with started_at = first
-//     detection of sitting (after a resumed contact gap the value is clamped
-//     to the device's previous contact, never backdating over an
-//     already-closed session)
-//   - vacant snapshot  → closeActiveSession with ended_at = first detection
-//     of vacancy (clamped to [started_at, now] in the session service)
-// Missing/garbage-free older payloads without the field keep the previous
-// server-"now" behavior.
 // ─────────────────────────────────────────────────────────────
 sittingRouter.post('/heartbeat', requireDeviceToken, async (req, res) => {
   if (!isSupabaseConfigured()) {
@@ -497,102 +447,19 @@ sittingRouter.post('/heartbeat', requireDeviceToken, async (req, res) => {
       ? body.deviceId.trim().slice(0, 64)
       : 'default';
 
-  const state = body.state;
-  if (state !== undefined && state !== 'relaxing' && state !== 'attentive' && state !== 'vacant') {
-    return res.status(400).json({
-      success: false,
-      error: 'state must be "relaxing", "attentive" or "vacant" when present',
-    });
+  const parsed = parseTelemetryPayload(body);
+  if (!parsed.ok) {
+    return res.status(400).json({ success: false, error: parsed.error });
   }
 
-  let distance: number | undefined;
-  if (body.distance !== undefined) {
-    distance = Number(body.distance);
-    if (!Number.isFinite(distance)) {
-      return res.status(400).json({ success: false, error: 'distance must be a number when present' });
-    }
+  const result = await processDeviceTelemetry(deviceId, parsed.snapshot, 'http');
+  if (!result.ok) {
+    return res.status(500).json({ success: false, error: result.error });
   }
 
-  let stateForMs: number | undefined;
-  if (body.stateForMs !== undefined) {
-    stateForMs = Number(body.stateForMs);
-    if (!Number.isFinite(stateForMs) || stateForMs < 0) {
-      return res.status(400).json({
-        success: false,
-        error: 'stateForMs must be a non-negative number when present',
-      });
-    }
-  }
-
-  if (body.timestamp !== undefined && !Number.isFinite(Number(body.timestamp))) {
-    return res.status(400).json({ success: false, error: 'timestamp must be a number when present' });
-  }
-
-  try {
-    // 1. Cache the reading for /status (in-memory only, never stored in the DB)
-    const { resumedAfterGap, previousContactAt } = recordTelemetry(deviceId, distance);
-
-    // 2. Edge-detect the state snapshot → session lifecycle via the shared service
-    if (state !== undefined && getLastKnownState(deviceId) !== state) {
-      setLastKnownState(deviceId, state);
-
-      if (state === 'vacant') {
-        // Anchor the close to when vacancy was FIRST detected (true stand-up
-        // moment), not when the confirmation completed / snapshot arrived
-        const result = await closeActiveSession(firstDetectedAt(stateForMs, null));
-        switch (result.status) {
-          case 'stopped':
-            console.log(
-              `[API /sitting/heartbeat] ${deviceId}: vacant — session closed, duration ${result.durationSeconds}s`
-            );
-            break;
-          case 'no_active_session':
-            // Duplicate vacant / session already closed by the stale-check — safe no-op
-            console.log(`[API /sitting/heartbeat] ${deviceId}: vacant — no active session, nothing to close`);
-            break;
-          case 'db_error':
-            console.error(`[API /sitting/heartbeat] ${deviceId}: failed to close session:`, result.error);
-            return res.status(500).json({ success: false, error: result.error });
-        }
-      } else {
-        // Anchor the open to when sitting was FIRST detected (true sit-down
-        // moment), not when the confirmation completed / snapshot arrived.
-        // After a resumed contact gap the backdate is clamped to the device's
-        // previous contact so it never overlaps an already-closed session.
-        const startedAt = firstDetectedAt(stateForMs, resumedAfterGap ? previousContactAt : null);
-        const result = await setPosture(state, startedAt);
-        switch (result.status) {
-          case 'updated':
-            console.log(
-              `[API /sitting/heartbeat] ${deviceId}: ${state} — session ${result.session.id} posture set to ${state}`
-            );
-            break;
-          case 'unchanged':
-            // Session already in this posture — safe no-op
-            console.log(`[API /sitting/heartbeat] ${deviceId}: ${state} — no posture change needed`);
-            break;
-          case 'db_error':
-            console.error(`[API /sitting/heartbeat] ${deviceId}: failed to set posture:`, result.error);
-            return res.status(500).json({ success: false, error: result.error });
-        }
-      }
-    }
-
-    // 3. Fresh contact → touch last_heartbeat_at (throttled; no-op when no session is active)
-    if (shouldTouchHeartbeat(deviceId)) {
-      await touchActiveSessionHeartbeat();
-    }
-
-    return res.json({
-      success: true,
-      deviceId,
-      timestamp: new Date().toISOString(),
-    });
-  } catch (err: unknown) {
-    console.error('[API /sitting/heartbeat] Internal error:', err);
-    return res.status(500).json({
-      success: false,
-      error: 'Internal error: ' + String(err),
-    });
-  }
+  return res.json({
+    success: true,
+    deviceId,
+    timestamp: new Date().toISOString(),
+  });
 });

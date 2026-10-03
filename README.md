@@ -23,14 +23,24 @@ The project is split into two apps:
 │  - Loop Delay: ~700ms           │
 └───────────────┬─────────────────┘
                 │
-                │ HTTP telemetry POST every 2.5s
-                │ POST /api/sitting/heartbeat + Bearer DEVICE_TOKEN
-                │ { distance, state, timestamp }
+                │ MQTT over TLS (primary): snapshot every 2.5s
+                │ sitting/device/<id>/telemetry + LWT status
+                │ (legacy HTTP POST /api/sitting/heartbeat kept
+                │  during the migration, removed after verification)
                 ▼
 ┌─────────────────────────────────┐
+│       EMQX Cloud (broker)       │
+│  - MQTT over TLS, port 8883     │
+│  - Device auth (user/password)  │
+└───────────────┬─────────────────┘
+                │
+                │ Backend subscribes: sitting/device/+/telemetry
+                │                     sitting/device/+/status (LWT)
+┌───────────────┴─────────────────┐
 │         Express API Server      │
 │         (backend/, TypeScript)  │
-│  - POST /api/sitting/heartbeat  │  ← device telemetry = heartbeat
+│  - MQTT telemetry subscriber    │  ← device telemetry = heartbeat
+│  - POST /api/sitting/heartbeat  │  ← legacy HTTP telemetry (migration)
 │  - GET  /api/sitting/status     │
 │  - GET  /api/sitting/stream     │  ← SSE (session/posture events)
 │  - POST /api/sitting/simulate   │
@@ -59,9 +69,45 @@ The project is split into two apps:
 
 ---
 
-## 🔗 Device ⇄ Backend HTTP Telemetry
+## 🔗 Device ⇄ Backend Telemetry
 
-The ESP8266 talks to the backend over **plain HTTP requests** — no persistent connection, no extra Arduino library (built-in `WiFiClientSecure`). Every **2.5 s** the device POSTs its **current** seating state and distance:
+The device publishes its state over **MQTT via EMQX Cloud** (the primary transport since the MQTT migration), and — during the migration period only — still POSTs the same snapshot over HTTP. Both transports feed the **same backend pipeline**, and identical snapshots are idempotent there (edge detection), so running both in parallel is safe.
+
+### MQTT transport (primary)
+
+```
+ESP8266 ──MQTT over TLS :8883──► EMQX Cloud ◄──MQTT over TLS── Express backend (mqtt.js)
+```
+
+Every **2.5 s** the device publishes its **current** seating state + distance to a device-specific topic:
+
+```json
+topic: sitting/device/sitting-tracker-01/telemetry
+{ "deviceId": "sitting-tracker-01", "distance": 10.5, "state": "attentive",
+  "timestamp": 1234567890, "stateForMs": 42000 }
+```
+
+- `state` is one of `relaxing` | `attentive` | `vacant` (classified on the device: < 8 cm relaxing · 8.5–45 cm attentive · > 45 cm or invalid vacant, with an 8–8.5 cm deadband and 2 s / 5 s debounce). `distance` `-1` = out of range. `timestamp` (epoch seconds from NTP) is informational only — the **server clock** remains the source of truth.
+- **Online/offline (LWT):** on every connect the device publishes a *retained* `"online"` to `sitting/device/<id>/status` and registers a *retained* Last-Will `"offline"`. If the device vanishes without a clean disconnect (power-off, Wi-Fi loss), the broker publishes the LWT after ~1.5× the 15 s keepalive; the backend marks the device offline in its in-memory store (the same state a 30 s HTTP contact gap produces).
+- **QoS:** telemetry publishes at QoS 0 (a snapshot arrives again 2.5 s later, and `stateForMs` keeps session timing exact); status publishes at QoS 1 with retain.
+- **Reconnect:** automatic on both sides — the ESP8266 throttles to one connect attempt per 5 s; the backend (mqtt.js) retries every 5 s and re-subscribes on success.
+- **TLS everywhere, no `setInsecure()`:** the ESP8266 embeds the **ISRG Root X1** CA (EMQX Cloud terminates TLS with a Let's Encrypt certificate) and validates the full chain against the NTP-synced clock; the backend uses `rejectUnauthorized: true` with Node's built-in roots.
+- **Auth:** broker-level username/password (created in the EMQX Cloud console). The `deviceId` is carried by the topic (`sitting/device/<id>/telemetry`), which is what the backend subscribes to with wildcards.
+
+### Backend env vars (MQTT)
+
+| Variable | Default | Meaning |
+| :--- | :--- | :--- |
+| `MQTT_BROKER_URL` | *(unset → MQTT disabled)* | `mqtts://<deployment>.emqxsl.com:8883` |
+| `MQTT_USERNAME` / `MQTT_PASSWORD` | — | EMQX Cloud credentials (Access Management → Authentication) |
+| `MQTT_CLIENT_ID` | `smart-tracking-backend-<pid>-<rand>` | unique per backend instance |
+| `MQTT_TELEMETRY_TOPIC` | `sitting/device/+/telemetry` | telemetry subscription |
+| `MQTT_STATUS_TOPIC` | `sitting/device/+/status` | LWT/online subscription |
+| `MQTT_CA_CERT` | *(Node's built-in roots)* | optional PEM bundle for private CAs (`\n` escapes unescaped) |
+
+### Legacy HTTP transport (removed after MQTT is verified)
+
+During the migration the firmware **also** POSTs the same snapshot every 2.5 s (this section describes what still exists today):
 
 **Exact URL:** `http://<backend-host>:4000/api/sitting/heartbeat` (dev) · `https://<backend-host>/api/sitting/heartbeat` (production)
 
@@ -73,28 +119,27 @@ Content-Type: application/json
 { "deviceId": "sitting-tracker-01", "distance": 10.5, "state": "attentive", "timestamp": 1234567890 }
 ```
 
-- `state` is one of `relaxing` | `attentive` | `vacant` (classified on the device: < 8 cm relaxing · 8.5–45 cm attentive · > 45 cm or invalid vacant, with an 8–8.5 cm deadband and 2 s / 5 s debounce).
-- `distance` is the latest HC-SR04 reading; `-1` = out of range.
-- `timestamp` (epoch seconds from NTP) is informational only — the **server clock** remains the source of truth for all session timing.
-- `distance`/`state`/`timestamp`/`deviceId` are all optional: a bare POST still works as a heartbeat-only touch.
+- Authenticated with `Authorization: Bearer <DEVICE_TOKEN>` (invalid tokens get `401/403`, malformed bodies `400`).
+- **Heartbeat = the telemetry POST itself.** A device that stops posting goes stale, and the `/status` stale-check auto-closes any active session (~30 s) with `ended_at` = last-contact time.
+- **Backend unavailable:** sensing never stops. The device skips the POST, keeps classifying locally, and retries on the next 2.5 s cycle. Because every POST is a full *current-state snapshot* (not an event), the first successful POST after an outage reconciles everything.
+- **Live distance on the dashboard:** arrives via the dashboard's 2.5 s `GET /status` poll. SSE is used for instant *session* events (`STATUS_CHANGE` / `POSTURE_CHANGE`) so chimes and notifications fire immediately.
 
-### How the backend processes each snapshot
+### How the backend processes each snapshot (shared by both transports)
 
-1. **Telemetry cache (in-memory, never persisted):** the reading is stored and surfaced by `GET /status` as `distanceCm` + `distanceUpdatedAt`. Readings older than 30 s are reported as no-reading, so a powered-off device shows "waiting for sensor…" instead of a frozen distance.
-2. **Edge-detected session transitions:** the backend compares the snapshot's state with the device's last known state and calls the shared `sessionService` **only on actual changes** — `relaxing`/`attentive` → `setPosture` (opens a session when vacant), `vacant` → `closeActiveSession`. Unchanged snapshots are no-ops (no DB hit every 2.5 s), and manual dashboard controls are never overridden by the device's unchanged state.
-3. **Heartbeat:** each fresh contact touches `last_heartbeat_at` (throttled to one write per 10 s — the same rate the old WebSocket ping loop used), so the `/status` stale-check keeps working unchanged.
-
-### Liveness, disconnects & reconnects
-
-- **Heartbeat = the telemetry POST itself.** No ping/pong exists anywhere anymore: a device that stops posting (power-off, Wi-Fi loss) goes stale, and the `/status` stale-check auto-closes any active session (~30 s) with `ended_at` = last-contact time.
-- **Backend unavailable:** sensing never stops. The device skips the POST, keeps classifying locally, and retries on the next 2.5 s cycle. Because every POST is a full *current-state snapshot* (not an event), the first successful POST after an outage reconciles everything — nothing is queued or replayed.
-- **Device restart while sitting:** the first snapshot re-syncs the current state; idempotent handling (`already_active`) means no duplicate session.
-- **Auth:** every POST carries `Authorization: Bearer <DEVICE_TOKEN>` (same shared device token as before — invalid tokens get `401/403`, malformed bodies `400`).
-- **Live distance on the dashboard:** arrives via the dashboard's 2.5 s `GET /status` poll. SSE is still used for instant *session* events (`STATUS_CHANGE` / `POSTURE_CHANGE`) so chimes and notifications fire immediately.
+1. **Validation:** `parseTelemetryPayload` enforces the same rules for MQTT messages as the HTTP route always did (error strings identical).
+2. **Telemetry cache (in-memory, never persisted):** the reading is stored and surfaced by `GET /status` as `distanceCm` + `distanceUpdatedAt`. Readings older than 30 s are reported as no-reading, so a powered-off device shows "waiting for sensor…" instead of a frozen distance.
+3. **Edge-detected session transitions:** the backend compares the snapshot's state with the device's last known state and calls the shared `sessionService` **only on actual changes** — `relaxing`/`attentive` → `setPosture` (opens a session when vacant), `vacant` → `closeActiveSession`. Unchanged snapshots are no-ops (no DB hit every 2.5 s), and manual dashboard controls are never overridden by the device's unchanged state.
+4. **Heartbeat:** each fresh contact touches `last_heartbeat_at` (throttled to one write per 10 s — the same rate the old WebSocket ping loop used), so the `/status` stale-check keeps working unchanged.
 
 ### Backend implementation
 
-`backend/src/lib/telemetryStore.ts` holds the in-memory telemetry state (latest reading per device, last known state per device, heartbeat-write throttle, online-device list for `/health`). `POST /heartbeat` in `backend/src/routes/sitting.ts` orchestrates: cache → edge-detect → `sessionService` → throttled heartbeat touch. Session open/close logic lives only in `backend/src/lib/sessionService.ts`, so telemetry, the dashboard's manual controls, and the stale-check all behave identically.
+`backend/src/lib/telemetryProcessor.ts` is the shared ingestion pipeline (validate → cache → edge-detect → `sessionService` → throttled heartbeat touch); the HTTP route (`POST /heartbeat`) and the MQTT subscriber (`backend/src/lib/mqttClient.ts`) are thin adapters over it. `backend/src/lib/telemetryStore.ts` holds the in-memory telemetry state (latest reading per device, last known state per device, heartbeat-write throttle, offline marking for MQTT LWT, online-device list for `/health`). Session open/close logic lives only in `backend/src/lib/sessionService.ts`, so MQTT telemetry, HTTP telemetry, the dashboard's manual controls, and the stale-check all behave identically.
+
+### Removing the HTTP heartbeat after verification
+
+Once MQTT is verified end-to-end (device + backend logs + EMQX dashboard):
+1. Firmware: set `USE_HTTP = false`, flash, re-verify, then delete the HTTP sections (config block, section 8 `HTTP TELEMETRY`, the `apiClient` globals) from `sitting_tracker.ino`.
+2. Backend: `POST /api/sitting/heartbeat` can then be deleted from `backend/src/routes/sitting.ts` (and `requireDeviceToken` if unused elsewhere).
 
 ---
 
@@ -235,7 +280,7 @@ The firmware source code is located in [`firmware/sitting_tracker/sitting_tracke
    http://arduino.esp8266.com/stable/package_esp8266com_index.json
    ```
 3. In **Tools > Board > Boards Manager**, search for `esp8266` and install the package.
-4. No extra libraries are needed — the firmware uses the built-in `WiFiClientSecure` (the old "WebSockets" library dependency was removed with the WebSocket transport).
+4. Install the **PubSubClient** library (Tools > Manage Libraries — MQTT client; 2.8+).
 5. Select **NodeMCU 1.0 (ESP-12E Module)** in **Tools > Board**.
 6. Set CPU Frequency: **80 MHz** or **160 MHz**, Upload Speed: **115200**.
 
@@ -249,21 +294,28 @@ const WifiCredential WIFI_NETWORKS[] = {
   { "Mywifi",  "12343211" },
 };
 
-// 2. Point at the Express backend's API (NOT the dashboard URL):
-//    Local dev (your computer's LAN IP):  http://192.168.1.120:4000/api/sitting/heartbeat
-//    Production:                          https://your-express-host/api/sitting/heartbeat
+// 2. MQTT broker (EMQX Cloud) — the device's telemetry transport
+const bool     USE_MQTT       = true;
+const char*    MQTT_HOST      = "your-deployment.ala.asia-southeast1.emqxsl.com";
+const uint16_t MQTT_PORT      = 8883;                  // MQTT over TLS
+const char*    MQTT_USERNAME  = "your-emqx-username";  // EMQX Cloud → Access Management
+const char*    MQTT_PASSWORD  = "your-emqx-password";
+const char*    MQTT_CLIENT_ID = "sitting-tracker-01";  // unique per device
+
+// 3. Legacy HTTP heartbeat (kept until MQTT is verified; set USE_HTTP=false to disable)
 const char*    API_HOST = "192.168.1.120";
 const uint16_t API_PORT = 4000;
 const char*    API_PATH = "/api/sitting/heartbeat";
-const bool     USE_TLS  = false;   // true → https:// (GTS Root R1 CA is already embedded)
+const bool     USE_TLS  = false;   // true → https:// (GTS Root R4 CA is already embedded)
+const bool     USE_HTTP = true;
 
-// 3. Device identity + token (must match DEVICE_TOKEN in backend/.env)
+// 4. Device identity + token (must match DEVICE_TOKEN in backend/.env)
 const char* DEVICE_ID    = "sitting-tracker-01";
 const char* DEVICE_TOKEN = "your-device-token";
 ```
 
 > [!NOTE]
-> The firmware talks to the **Express backend's API**, not the Next.js frontend. Repoint `API_HOST`/`API_PORT` to wherever you deploy `backend/` — the old Vercel URL only serves the dashboard now.
+> The **ISRG Root X1** CA needed for EMQX Cloud's TLS is already embedded in the sketch (`MQTT_CA_CERT`) — full chain + hostname validation, no `setInsecure()` anywhere. If you ever swap to a self-hosted broker with a private CA, replace that PEM.
 
 ### Flashing the NodeMCU
 1. Connect the NodeMCU to your computer via micro-USB.
@@ -275,8 +327,9 @@ const char* DEVICE_TOKEN = "your-device-token";
    - NTP time sync (needed for TLS certificate validation + the timestamp field)
    - Continuous sensor readings every ~700ms
    - Debounce status and transition logs
-   - `[API] Telemetry POST: <state> @ <distance> cm → HTTP 200` every 2.5s
-   - `[API] Connect failed — offline, sensing continues` when the backend is unreachable (retried automatically on the next cycle)
+   - `[MQTT] Connected — status: online, LWT: offline` and `[MQTT] Telemetry: <state> @ <distance> cm` every 2.5s
+   - `[API] Telemetry POST: <state> @ <distance> cm → HTTP 200` every 2.5s (legacy HTTP, during the migration)
+   - `[MQTT] Connect failed (state …)` / `[API] Connect failed` when unreachable — retried automatically (MQTT reconnects are throttled to one attempt per 5 s)
 
 ---
 
@@ -284,12 +337,13 @@ const char* DEVICE_TOKEN = "your-device-token";
 
 | Edge Case | Solution & Handling |
 | :--- | :--- |
-| **NodeMCU restarts while sitting** | The device's first telemetry POST carries its current state; the backend checks if an active session already exists — if yes, posture handling is idempotent and no duplicate session is created. |
-| **Duplicate state snapshots** | Idempotent design. The backend edge-detects state per device: unchanged snapshots (e.g. `attentive` every 2.5s while sitting) are safe no-ops with zero DB impact; `vacant` with no active session is a safe no-op. |
-| **Device stops posting (power-off, Wi-Fi loss)** | No dedicated ping/pong — the telemetry POST *is* the heartbeat. The session stays active for a grace window; the `/status` stale-check closes it (~30 s) with `ended_at` = last-contact time. The dashboard also shows "waiting for sensor…" once the last distance reading is >30 s old. |
-| **Backend unavailable** | Sensing never stops. The device skips the POST and retries on the next 2.5 s cycle; the first successful POST after recovery carries the full current state, so nothing is queued or replayed and no stale event is ever sent. |
+| **NodeMCU restarts while sitting** | The device's first telemetry snapshot carries its current state; the backend checks if an active session already exists — if yes, posture handling is idempotent and no duplicate session is created. |
+| **Duplicate state snapshots** | Idempotent design. The backend edge-detects state per device: unchanged snapshots (e.g. `attentive` every 2.5s while sitting) are safe no-ops with zero DB impact; `vacant` with no active session is a safe no-op. This also makes the MQTT + HTTP double-delivery during the migration harmless. |
+| **Device stops posting (power-off, Wi-Fi loss)** | MQTT: the broker fires the retained LWT `offline` (~22 s) and the backend marks the device offline in its store. HTTP: the telemetry POST *is* the heartbeat, so silence goes stale. Either way the `/status` stale-check closes the session (~30 s) with `ended_at` = last-contact time, and the dashboard shows "waiting for sensor…" once the last distance reading is >30 s old. |
+| **MQTT broker unreachable / Wi-Fi down** | The device keeps sensing and retries (one MQTT attempt per 5 s, HTTP per cycle). Every transport message is a full current-state snapshot, so the first successful send after recovery reconciles everything — nothing is queued or replayed. |
+| **Backend unavailable / MQTT subscriber down** | mqtt.js reconnects every 5 s and re-subscribes; the retained LWT status survives backend restarts. Device-side behavior is unchanged — snapshots reconcile on the next send. |
 | **Session crossing midnight** | The statistics engine computes the mathematical intersection between any session `[started_at, ended_at]` and the day's boundaries `[00:00:00, 23:59:59]`. A session starting at 23:45 and ending at 00:30 correctly attributes 15m to yesterday and 30m to today. |
-| **Malformed / hostile HTTP requests** | Every device request is Bearer-authenticated (`401/403` on bad tokens) and body-validated (`400` on bad `state`/`distance`/`timestamp`). JSON parse errors are handled by a safe Express error handler that can never crash the server. |
+| **Malformed / hostile HTTP requests** | Every device request is Bearer-authenticated (`401/403` on bad tokens) and body-validated (`400` on bad `state`/`distance`/`timestamp`). JSON parse errors are handled by a safe Express error handler that can never crash the server. MQTT payloads get the same validation; non-JSON/invalid messages are dropped with a log. |
 | **Server as single source of truth** | The device's `timestamp` field is informational only. Server clock (`new Date()`) sets `started_at`, `ended_at`, and `duration_seconds`. |
 | **Active Session Live Ticking** | The frontend uses `started_at` from the server to tick locally every second, preventing unnecessary database writes. |
 
@@ -320,6 +374,31 @@ Options: `--url=http://localhost:4000` · `--token=…` · `--id=sitting-tracker
 
 > [!WARNING]
 > The simulator writes real sessions to whatever Supabase your backend points at. Don't run `attentive`/`vacant`/`crash`/`reconnect` while your real device is mid-session.
+
+### MQTT device simulator (no hardware needed)
+
+An MQTT twin of the HTTP simulator lives at [`backend/scripts/mqtt-device-simulator.mjs`](./backend/scripts/mqtt-device-simulator.mjs). It connects to EMQX Cloud exactly like the firmware (TLS + username/password + LWT) and publishes the same snapshot JSON. Use it to verify the MQTT path **before reflashing the ESP8266**:
+
+```bash
+cd backend   # MQTT_BROKER_URL / MQTT_USERNAME / MQTT_PASSWORD come from backend/.env
+
+node scripts/mqtt-device-simulator.mjs attentive  # open a session (one snapshot publish)
+node scripts/mqtt-device-simulator.mjs relax      # switch the active session to relaxing
+node scripts/mqtt-device-simulator.mjs vacant     # close the session
+node scripts/mqtt-device-simulator.mjs stream     # publish a snapshot every 2.5s (Ctrl+C to stop)
+node scripts/mqtt-device-simulator.mjs crash      # exit without DISCONNECT → broker fires the LWT
+                                                  # (~22s) → backend logs the device going offline
+node scripts/mqtt-device-simulator.mjs badjson    # non-JSON payload → dropped, server stays healthy
+```
+
+Options: `--url=mqtts://host:8883` · `--username=…` · `--password=…` · `--id=sitting-tracker-01` · `--state=…` · `--distance=…`.
+
+Verification checklist for the MQTT migration (run the backend locally with the MQTT env vars set):
+1. `[MQTT] Connected to broker — subscribing to sitting/device/+/telemetry + sitting/device/+/status` in the backend log.
+2. `stream` → `[TELEMETRY mqtt]` snapshot logs, dashboard distance + status updating.
+3. `vacant` → session closes with the device-derived `ended_at`.
+4. `crash` → ~22 s later, `[TELEMETRY] … marked offline (MQTT LWT / broker status)`, and the /status stale-check closes an active session at last contact as before.
+5. Check `GET /health` → `"mqtt": {"enabled": true, "connected": true, …}`.
 
 ### HTTP endpoints via cURL
 

@@ -31,37 +31,54 @@
  *                          (posture switch only — never opens/closes a session)
  *   - SENSOR_INTERVAL    = 700 ms  (ultrasonic ping interval)
  *
- * Communication (HTTP telemetry — replaces the old persistent WebSocket):
- *   - Every 2.5s the device POSTs its CURRENT seating state + distance:
- *       POST /api/sitting/heartbeat
- *       Authorization: Bearer <DEVICE_TOKEN>
+ * Communication (MQTT over TLS via EMQX Cloud — primary; the HTTP heartbeat
+ * is kept during the migration and removed once MQTT is verified):
+ *   - Every 2.5s the device publishes its CURRENT seating state + distance
+ *     as JSON to the MQTT topic sitting/device/<deviceId>/telemetry:
  *       { "deviceId": "sitting-tracker-01", "distance": 10.5,
  *         "state": "relaxing|attentive|vacant", "timestamp": <epoch secs>,
  *         "stateForMs": <ms the reported state has been continuously
  *                        measured, i.e. since its confirmation window began> }
- *     The backend uses `stateForMs` to anchor session started_at/ended_at to
- *     FIRST DETECTION of the new state (true sit-down / stand-up moments) so
- *     the 5 s / 10 s confirmation windows never inflate the recorded sitting
- *     duration.
- *   - Each request IS the device's last-contact/heartbeat signal: the backend
- *     touches last_heartbeat_at and auto-closes the session via its stale
- *     check if the snapshots stop arriving (power-off, Wi-Fi loss).
- *   - Because every POST carries the full current state (not events), there is
- *     nothing to queue or re-sync after an outage: if the backend is
- *     unavailable the device simply keeps sensing, and the next successful
- *     POST reconciles everything (the backend only acts on state CHANGES).
- *   - TLS uses the embedded GTS Root R1 CA (full chain + hostname validation,
- *     no setInsecure anywhere); NTP sync provides the clock both for
+ *     The backend (backend/src/lib/mqttClient.ts) subscribes to
+ *     sitting/device/+/telemetry and feeds every message into the SAME
+ *     pipeline as the old HTTP heartbeat, so `stateForMs` still anchors
+ *     session started_at/ended_at to FIRST DETECTION of the new state (true
+ *     sit-down / stand-up moments) and the 5 s / 10 s confirmation windows
+ *     never inflate the recorded sitting duration.
+ *   - Online/offline status uses MQTT Last-Will-and-Testament: on every
+ *     connect the device publishes a retained "online" to
+ *     sitting/device/<deviceId>/status, and the broker publishes the
+ *     retained LWT "offline" for it if the device vanishes without a clean
+ *     disconnect (power-off, Wi-Fi loss) — after ~1.5× the 15 s keepalive.
+ *   - Each snapshot is still the device's heartbeat: the backend touches
+ *     last_heartbeat_at (throttled) and the /status stale-check auto-closes
+ *     the session via that signal if snapshots stop arriving.
+ *   - Because every message carries the full current state (not events),
+ *     there is nothing to queue or re-sync after an outage: if the broker is
+ *     unreachable the device simply keeps sensing, and the next published
+ *     snapshot reconciles everything (the backend only acts on state
+ *     CHANGES). MQTT reconnects automatically (one attempt per 5 s).
+ *   - TLS uses the embedded ISRG Root X1 CA (EMQX Cloud terminates TLS with
+ *     a Let's Encrypt certificate — full chain + hostname validation, no
+ *     setInsecure anywhere); NTP sync provides the clock both for
  *     certificate validation and the timestamp field.
  *
- * Required Arduino libraries: none beyond the ESP8266 core (built-in
- * WiFiClientSecure). The old "WebSockets" library dependency is gone.
+ * Migration switch (both transports run in parallel): the device publishes
+ * the MQTT snapshot AND posts the HTTP heartbeat; identical snapshots are
+ * idempotent in the shared backend pipeline (edge detection), so double
+ * delivery is harmless and each transport can be verified against real
+ * traffic. After MQTT is verified end-to-end: set USE_HTTP false (HTTP-only
+ * removal) — see the "HTTP TELEMETRY" section for the code to delete.
+ *
+ * Required Arduino libraries: PubSubClient (Nick O'Leary — Library Manager);
+ * everything else is the ESP8266 core (built-in WiFiClientSecure/BearSSL).
  * ==============================================================================
  */
 
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
 #include <BearSSLHelpers.h>
+#include <PubSubClient.h>
 #include <time.h>
 
 // Pure seating-state machine (thresholds, confirmation windows, debounce) —
@@ -97,6 +114,9 @@ const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
 
 // ---------------------------------------------------------------------------
 // Backend API configuration (the Express backend, NOT the dashboard URL)
+// — the HTTP heartbeat transport. KEPT during the MQTT migration so MQTT can
+// be verified against real traffic before the HTTP path is removed; set
+// USE_HTTP false (or delete section 8) after MQTT is verified end-to-end.
 //
 // Production — Render.com (TLS terminated by Render, port 443):
 //   https://sitting-track-iot.onrender.com/api/sitting/heartbeat
@@ -116,6 +136,8 @@ const char*    API_HOST = "sitting-track-iot.onrender.com";
 const uint16_t API_PORT = 443;                 // 443 for Render (https), 4000 for local dev
 const char*    API_PATH = "/api/sitting/heartbeat";
 const bool     USE_TLS  = true;                // true → https:// (Render); false → local dev
+const bool     USE_HTTP = true;                // HTTP heartbeat master switch (migration:
+                                               // set false once MQTT is verified end-to-end)
 
 // Root CA for production https:// — GTS Root R4 (Google Trust Services, ECDSA/P-384).
 // Render.com's TLS chain: leaf → WE1 (intermediate) → GTS Root R4 (this root).
@@ -142,6 +164,84 @@ const char* API_CA_CERT =
   "9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8\n"
   "p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD\n"
   "-----END CERTIFICATE-----\n";
+
+// ---------------------------------------------------------------------------
+// MQTT configuration (EMQX Cloud) — the device's telemetry transport.
+//
+// EMQX Cloud console → your deployment → "Connection info" gives the host
+// (mqtts://, port 8883); "Access Management" → "Authentication" is where the
+// username/password below is created. Topics (built in setup() from DEVICE_ID):
+//   sitting/device/<DEVICE_ID>/telemetry — state snapshots, same JSON fields
+//                                          as the HTTP heartbeat body
+//   sitting/device/<DEVICE_ID>/status    — retained "online" on connect +
+//                                          retained LWT "offline" (the broker
+//                                          publishes it if this device
+//                                          vanishes without a clean disconnect)
+//
+// The backend subscribes to these with wildcards and feeds every message
+// into the same pipeline as the HTTP heartbeat, so during the migration BOTH
+// transports can carry identical snapshots safely (the backend edge-detects,
+// so the second copy of a snapshot is a no-op).
+// ---------------------------------------------------------------------------
+const bool     USE_MQTT       = true;
+const char*    MQTT_HOST      = "zfc11cf7.ala.asia-southeast1.emqxsl.com";
+const uint16_t MQTT_PORT      = 8883;
+const char*    MQTT_USERNAME  = "sitting-iot";
+const char*    MQTT_PASSWORD  = "Mk727498";
+const char*    MQTT_CLIENT_ID = "sitting-tracker-01";   // must be unique per device
+
+// Root CA for MQTT over TLS — ISRG Root X1 (Internet Security Research Group
+// / Let's Encrypt). EMQX Cloud's *.emqxsl.com endpoints terminate TLS with
+// Let's Encrypt certificates: leaf → intermediate → ISRG Root X1 (this root).
+// Self-signed, valid 2015–2035. Source: https://letsencrypt.org/certs/isrgrootx1.pem
+//
+// BearSSL validates the full certificate chain and the notValidBefore/After
+// dates against the NTP-synced clock (handed to the client via setX509Time —
+// the core does not read the clock by itself), so no setInsecure() is used
+// anywhere. If you self-host a broker with a private CA, paste ITS root here
+// instead.
+const char* MQTT_CA_CERT =
+  "-----BEGIN CERTIFICATE-----\n"
+  "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\n"
+  "-----END CERTIFICATE-----\n";
+
+// BearSSL TLS record buffer sizes for the MQTT connection. The device keeps
+// TWO TLS connections alive during the migration (HTTP + MQTT), and the ESP8266
+// has ~80 KB of RAM total — so the MQTT connection negotiates MFLN (RFC 6066
+// max-fragment-length) to shrink its record buffers from the 16 KB BearSSL
+// default to 512 B; EMQX Cloud negotiates MFLN fine. If [MQTT] logs show the
+// TLS handshake failing against a different broker, raise MQTT_TLS_RX_BUFFER
+// (e.g. 2048) — at the cost of free heap.
+const uint16_t MQTT_TLS_RX_BUFFER = 512;
+const uint16_t MQTT_TLS_TX_BUFFER = 512;
 
 // This device's identity (sent in the telemetry payload; the Bearer token is
 // the actual authentication)
@@ -207,6 +307,22 @@ WiFiClient* apiClient = nullptr;
 // USE_TLS so non-TLS builds don't pay for it.
 BearSSL::X509List* apiTrustAnchors = nullptr;
 
+// MQTT client (PubSubClient) over its own BearSSL TLS connection — separate
+// from the HTTP client so neither transport can stall the other.
+WiFiClientSecure mqttTlsClient;
+PubSubClient mqttClient(mqttTlsClient);
+BearSSL::X509List* mqttTrustAnchors = nullptr;
+bool mqttReady = false;   // config parsed + trust anchors loaded
+
+// Topic strings built in setup() from DEVICE_ID (sized for a 64-char id)
+char MQTT_TELEMETRY_TOPIC[96];
+char MQTT_STATUS_TOPIC[96];
+
+// Throttled automatic reconnect: one connect attempt per interval. A failed
+// attempt (TCP connect + TLS handshake) is blocking, so never retry hot.
+unsigned long lastMqttReconnectAttemptMs = 0;
+const unsigned long MQTT_RECONNECT_INTERVAL_MS = 5000;
+
 // Timer for sensor reading loop
 unsigned long lastSensorReadTime = 0;
 unsigned long lastTelemetryPostTime = 0;   // telemetry POST pacing
@@ -220,6 +336,10 @@ float readDistanceCm();
 const char* stateName(State s);
 bool ensureApiClientConnected();
 bool postTelemetry();
+void setupMqtt();
+bool connectMqtt();
+void ensureMqttConnected();
+bool publishTelemetryMqtt();
 void connectToWiFi();
 bool tryConnectToNetwork(const WifiCredential& net);
 
@@ -234,7 +354,7 @@ void setup() {
   Serial.println();
   Serial.println(F("========================================"));
   Serial.println(F("  Sitting Time Tracker - NodeMCU ESP8266"));
-  Serial.println(F("  Transport: HTTP telemetry (2.5s POST)"));
+  Serial.println(F("  Transport: MQTT over TLS (EMQX Cloud) + HTTP heartbeat"));
   Serial.println(F("========================================"));
 
   pinMode(PIN_TRIG, OUTPUT);
@@ -243,40 +363,58 @@ void setup() {
 
   connectToWiFi();
 
-  // --- Backend HTTP client setup ---
-  if (USE_TLS) {
-    // TLS certificate validation needs a correct clock — start NTP sync.
-    // (The clock also feeds the telemetry payload's timestamp field.)
-    configTime(0, 0, "pool.ntp.org", "time.google.com");
-    if (strlen(API_CA_CERT) > 0) {
-      Serial.print(F("[NTP] Waiting for time sync"));
-      unsigned long timeStart = millis();
-      while (time(nullptr) < 1000000000 && millis() - timeStart < 10000) { // wait up to 10s
-        delay(250);
-        Serial.print(F("."));
+  // --- Backend HTTP client setup (kept during the MQTT migration) ---
+  if (USE_HTTP) {
+    if (USE_TLS) {
+      // TLS certificate validation needs a correct clock — start NTP sync.
+      // (The clock also feeds the telemetry payload's timestamp field.)
+      configTime(0, 0, "pool.ntp.org", "time.google.com");
+      if (strlen(API_CA_CERT) > 0) {
+        Serial.print(F("[NTP] Waiting for time sync"));
+        unsigned long timeStart = millis();
+        while (time(nullptr) < 1000000000 && millis() - timeStart < 10000) { // wait up to 10s
+          delay(250);
+          Serial.print(F("."));
+        }
+        Serial.println();
+        // Parse the PEM root CA into BearSSL trust anchors. (Note: ESP8266's
+        // WiFiClientSecure has no setCACert() — that's the ESP32 API — and it
+        // does NOT pick up the NTP clock by itself; see setX509Time() below.)
+        apiTrustAnchors = new BearSSL::X509List(API_CA_CERT);
+        tlsClient.setTrustAnchors(apiTrustAnchors);
+      } else {
+        Serial.println(F("[TLS] WARNING: USE_TLS=true but API_CA_CERT is empty."));
+        Serial.println(F("[TLS] Connecting with UNVALIDATED TLS (no server-identity check)."));
+        Serial.println(F("[TLS] Paste the GTS Root R1 PEM into API_CA_CERT for production."));
       }
-      Serial.println();
-      // Parse the PEM root CA into BearSSL trust anchors. (Note: ESP8266's
-      // WiFiClientSecure has no setCACert() — that's the ESP32 API — and it
-      // does NOT pick up the NTP clock by itself; see setX509Time() below.)
-      apiTrustAnchors = new BearSSL::X509List(API_CA_CERT);
-      tlsClient.setTrustAnchors(apiTrustAnchors);
+      apiClient = &tlsClient;
     } else {
-      Serial.println(F("[TLS] WARNING: USE_TLS=true but API_CA_CERT is empty."));
-      Serial.println(F("[TLS] Connecting with UNVALIDATED TLS (no server-identity check)."));
-      Serial.println(F("[TLS] Paste the GTS Root R1 PEM into API_CA_CERT for production."));
+      apiClient = &plainClient;
     }
-    apiClient = &tlsClient;
+    apiClient->setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+    Serial.print(F("[API] Telemetry endpoint: "));
+    Serial.print(USE_TLS ? F("https://") : F("http://"));
+    Serial.print(API_HOST);
+    Serial.print(F(":"));
+    Serial.print(API_PORT);
+    Serial.println(API_PATH);
   } else {
-    apiClient = &plainClient;
+    // MQTT is the only telemetry transport — NTP is still needed for TLS
+    // certificate validation and the payload timestamp.
+    configTime(0, 0, "pool.ntp.org", "time.google.com");
+    Serial.print(F("[NTP] Waiting for time sync"));
+    unsigned long timeStart = millis();
+    while (time(nullptr) < 1000000000 && millis() - timeStart < 10000) { // wait up to 10s
+      delay(250);
+      Serial.print(F("."));
+    }
+    Serial.println();
   }
-  apiClient->setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
-  Serial.print(F("[API] Telemetry endpoint: "));
-  Serial.print(USE_TLS ? F("https://") : F("http://"));
-  Serial.print(API_HOST);
-  Serial.print(F(":"));
-  Serial.print(API_PORT);
-  Serial.println(API_PATH);
+
+  // --- MQTT (EMQX Cloud) client setup ---
+  if (USE_MQTT) {
+    setupMqtt();
+  }
 
   // Initial read to calibrate
   float initialDistance = readDistanceCm();
@@ -356,13 +494,23 @@ void loop() {
     Serial.println();
   }
 
-  // 3. Periodic telemetry POST (every TELEMETRY_INTERVAL_MS). Carries the
-  //    current state + latest distance; the backend treats it as the device
-  //    heartbeat. Silently skipped while offline — sensing continues, and the
-  //    next successful POST reconciles everything (it's a state snapshot).
+  // 3. Maintain the MQTT connection: service keepalive pings/incoming packets
+  //    on every pass and reconnect (throttled to one attempt per interval)
+  //    whenever the broker connection is gone.
+  if (USE_MQTT) {
+    ensureMqttConnected();
+    if (mqttReady) mqttClient.loop();
+  }
+
+  // 4. Periodic telemetry (every TELEMETRY_INTERVAL_MS). Both transports send
+  //    the same current-state snapshot; the backend's edge detection makes
+  //    the second copy a no-op, so running both during the migration is safe.
+  //    Silently skipped while offline — sensing continues, and the next
+  //    successful send reconciles everything (it's a state snapshot).
   if (now - lastTelemetryPostTime >= TELEMETRY_INTERVAL_MS) {
     lastTelemetryPostTime = now;
-    postTelemetry();
+    postTelemetry();         // HTTP heartbeat — removed once MQTT is verified
+    publishTelemetryMqtt();  // MQTT snapshot — EMQX Cloud
   }
 
   yield(); // Allow ESP8266 background tasks (WiFi, TCP) to run
@@ -397,7 +545,9 @@ float readDistanceCm() {
 }
 
 // ==============================================================================
-// 8. HTTP TELEMETRY (replaces the old WebSocket dispatch)
+// 8. HTTP TELEMETRY (legacy transport — kept during the MQTT migration so the
+//    MQTT path can be verified against real traffic first; delete this section
+//    + the USE_HTTP config parts once MQTT is verified end-to-end)
 // ==============================================================================
 
 /** Wire/serial name for a state — matches the backend telemetry vocabulary */
@@ -442,6 +592,7 @@ bool ensureApiClientConnected() {
  * queued or replayed after an outage.
  */
 bool postTelemetry() {
+  if (!USE_HTTP) return false;
   if (WiFi.status() != WL_CONNECTED) return false;
   if (!ensureApiClientConnected()) return false;
 
@@ -534,7 +685,127 @@ bool postTelemetry() {
 }
 
 // ==============================================================================
-// 9. WI-FI CONNECTION & RECONNECT HANDLER (Multi-Network) — unchanged
+// 9. MQTT TELEMETRY (EMQX Cloud — primary transport)
+// ==============================================================================
+
+/**
+ * One-time MQTT setup: build the device topics from DEVICE_ID, parse the
+ * ISRG Root X1 trust anchors, and configure the PubSubClient (broker, MFLN
+ * buffer sizes, keepalive). Refuses to enable MQTT without a CA cert —
+ * TLS certificate validation is never skipped (no setInsecure).
+ */
+void setupMqtt() {
+  snprintf(MQTT_TELEMETRY_TOPIC, sizeof(MQTT_TELEMETRY_TOPIC), "sitting/device/%s/telemetry", DEVICE_ID);
+  snprintf(MQTT_STATUS_TOPIC, sizeof(MQTT_STATUS_TOPIC), "sitting/device/%s/status", DEVICE_ID);
+
+  if (strlen(MQTT_CA_CERT) == 0) {
+    Serial.println(F("[MQTT] ERROR: MQTT_CA_CERT is empty — MQTT disabled (HTTP heartbeat continues)."));
+    Serial.println(F("[MQTT] TLS certificate validation is mandatory; no setInsecure fallback exists."));
+    return;
+  }
+
+  mqttTrustAnchors = new BearSSL::X509List(MQTT_CA_CERT);
+  mqttTlsClient.setTrustAnchors(mqttTrustAnchors);
+  // MFLN (RFC 6066): shrink the TLS record buffers so the two live TLS
+  // connections (HTTP + MQTT) fit in the ESP8266's heap together.
+  mqttTlsClient.setBufferSizes(MQTT_TLS_RX_BUFFER, MQTT_TLS_TX_BUFFER);
+
+  mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+  mqttClient.setBufferSize(512);   // headroom over the ~140-byte snapshot payload
+  mqttClient.setKeepAlive(15);     // broker fires the LWT after ~1.5× this
+  mqttClient.setSocketTimeout(10); // seconds to wait for CONNACK
+
+  Serial.print(F("[MQTT] Broker: "));
+  Serial.print(MQTT_HOST);
+  Serial.print(F(":"));
+  Serial.println(MQTT_PORT);
+  Serial.print(F("[MQTT] Telemetry topic: "));
+  Serial.println(MQTT_TELEMETRY_TOPIC);
+  Serial.print(F("[MQTT] Status topic:    "));
+  Serial.println(MQTT_STATUS_TOPIC);
+  mqttReady = true;
+}
+
+/**
+ * One MQTT connect attempt (blocking: TCP + TLS handshake + CONNACK, a few
+ * seconds on ESP8266). Registers the retained LWT "offline" on the status
+ * topic and publishes the retained "online" on success. The caller throttles
+ * attempts to one per MQTT_RECONNECT_INTERVAL_MS.
+ */
+bool connectMqtt() {
+  if (!mqttReady) return false;
+
+  // BearSSL checks the certificate's notValidBefore/After against the time
+  // WE hand it — the core never reads the NTP clock on its own. Refresh it
+  // on every (re)connect so a late NTP sync self-heals.
+  mqttTlsClient.setX509Time(time(nullptr));
+  // Start from a clean socket so a half-dead TLS session can't poison this handshake.
+  mqttTlsClient.stop();
+
+  Serial.print(F("[MQTT] Connecting to "));
+  Serial.print(MQTT_HOST);
+  Serial.println(F(" ..."));
+  // Last Will and Testament: if this device vanishes without a clean
+  // disconnect (power-off, Wi-Fi loss), the broker publishes the retained
+  // "offline" here after ~1.5× keepalive — the backend marks the device
+  // offline on that message.
+  bool ok = mqttClient.connect(MQTT_CLIENT_ID, MQTT_USERNAME, MQTT_PASSWORD,
+                               MQTT_STATUS_TOPIC, 1, true, "offline");
+  if (!ok) {
+    Serial.print(F("[MQTT] Connect failed (state "));
+    Serial.print(mqttClient.state());
+    Serial.println(F(") — HTTP heartbeat continues, sensing unaffected"));
+    return false;
+  }
+
+  // Retained "online": also received by the backend (re)subscribing later,
+  // so a restarted backend learns the device is up immediately.
+  mqttClient.publish(MQTT_STATUS_TOPIC, "online", true);
+  Serial.println(F("[MQTT] Connected — status: online, LWT: offline"));
+  return true;
+}
+
+/** Automatic reconnect, throttled so a failed attempt never hot-loops. */
+void ensureMqttConnected() {
+  if (!USE_MQTT || !mqttReady) return;
+  if (mqttClient.connected()) return;
+
+  unsigned long now = millis();
+  if (now - lastMqttReconnectAttemptMs < MQTT_RECONNECT_INTERVAL_MS) return;
+  lastMqttReconnectAttemptMs = now;
+  connectMqtt();
+}
+
+/**
+ * Publish one telemetry snapshot to sitting/device/<id>/telemetry — the same
+ * JSON fields as the HTTP POST body. QoS 0 on purpose: a snapshot every 2.5 s
+ * needs no per-message acks (a dropped one is reconciled by the next, and
+ * `stateForMs` keeps the recorded session timing exact anyway).
+ */
+bool publishTelemetryMqtt() {
+  if (!USE_MQTT || !mqttClient.connected()) return false;
+
+  char payload[160];
+  snprintf(payload, sizeof(payload),
+           "{\"deviceId\":\"%s\",\"distance\":%.1f,\"state\":\"%s\",\"timestamp\":%lu,\"stateForMs\":%lu}",
+           DEVICE_ID, lastMeasuredDistanceCm, stateName(debounce.current),
+           (unsigned long)time(nullptr), (unsigned long)(millis() - debounce.currentSince));
+
+  bool ok = mqttClient.publish(MQTT_TELEMETRY_TOPIC, payload);
+  if (ok) {
+    Serial.print(F("[MQTT] Telemetry: "));
+    Serial.print(stateName(debounce.current));
+    Serial.print(F(" @ "));
+    Serial.print(lastMeasuredDistanceCm, 1);
+    Serial.println(F(" cm"));
+  } else {
+    Serial.println(F("[MQTT] Publish failed — state held locally, reconciled by the next snapshot"));
+  }
+  return ok;
+}
+
+// ==============================================================================
+// 10. WI-FI CONNECTION & RECONNECT HANDLER (Multi-Network) — unchanged
 // ==============================================================================
 
 // Attempt to connect to a single network; returns true on success.

@@ -4,6 +4,7 @@ import cors from 'cors';
 import { sittingRouter } from './routes/sitting';
 import { eventBroadcaster } from './lib/eventBroadcaster';
 import { getOnlineDeviceIds } from './lib/telemetryStore';
+import { getMqttStatus, startMqttClient } from './lib/mqttClient';
 
 const app = express();
 
@@ -27,7 +28,12 @@ app.use('/api/sitting', sittingRouter);
 
 // Health check
 app.get('/health', (_req, res) => {
-  res.json({ success: true, sseClients: eventBroadcaster.getClientCount(), onlineDevices: getOnlineDeviceIds() });
+  res.json({
+    success: true,
+    sseClients: eventBroadcaster.getClientCount(),
+    onlineDevices: getOnlineDeviceIds(),
+    mqtt: getMqttStatus(),
+  });
 });
 
 // JSON body parse errors and unexpected errors
@@ -51,4 +57,7 @@ const port = parseInt(process.env.PORT || '4000', 10);
 app.listen(port, () => {
   console.log(`[SERVER] Smart Tracking API listening on http://localhost:${port}`);
   console.log(`[SERVER] CORS origins: ${allowedOrigins.join(', ')}`);
+  // MQTT telemetry subscriber (EMQX Cloud) — runs alongside the HTTP
+  // heartbeat during the migration; no-ops when MQTT_BROKER_URL is unset.
+  startMqttClient();
 });
