@@ -31,6 +31,34 @@ function singleQuery(value: unknown): string | null {
 }
 
 /**
+ * How far a device-derived session timestamp may be backdated from server
+ * "now". The normal flow only needs the confirmation windows (~5–12.5s);
+ * the cap keeps a bogus/lost value from anchoring a session absurdly far in
+ * the past (e.g. millis() corruption) — longer outages keep today's behavior
+ * (session starts when contact resumes).
+ */
+const MAX_FIRST_DETECTION_BACKDATE_MS = 300_000;
+
+/**
+ * Convert the device's `stateForMs` (how long the reported state has been
+ * continuously measured — i.e. when its confirmation window BEGAN) into an
+ * absolute first-detection moment anchored to the server clock. Returns
+ * undefined when absent (old firmware / heartbeat-only POST) so those flows
+ * keep the previous server-"now" timing.
+ *
+ * `notBeforeMs` (used after a resumed contact gap) stops a device returning
+ * still-sitting from backdating a new session into time already covered by
+ * the session the stale-check just closed.
+ */
+function firstDetectedAt(stateForMs: number | undefined, notBeforeMs: number | null): Date | undefined {
+  if (stateForMs === undefined) return undefined;
+  const nowMs = Date.now();
+  const candidate = nowMs - Math.min(stateForMs, MAX_FIRST_DETECTION_BACKDATE_MS);
+  const clamped = notBeforeMs !== null ? Math.max(candidate, notBeforeMs) : candidate;
+  return new Date(Math.min(clamped, nowMs));
+}
+
+/**
  * Split a session's overlap with a time window into relax/attentive seconds.
  * The active session's running posture stretch (not yet flushed to the DB) is
  * included; the share is proportional when a session crosses the window edge
@@ -427,6 +455,10 @@ sittingRouter.post('/simulate', async (req, res) => {
 //    state; only actual transitions call the shared sessionService, so
 //    manual dashboard controls are never overridden by unchanged snapshots
 //    and identical snapshots don't hit the DB every 2.5s.
+//    (The device debounce is the confirmation layer: it only reports sitting
+//    after 5s of continuous sitting and vacant after 10s of continuous
+//    vacant — see firmware/sitting_tracker/debounce.h — so snapshots
+//    arriving here are already-confirmed transitions.)
 //    - relaxing/attentive → setPosture (opens a session when vacant)
 //    - vacant             → closeActiveSession
 // 3. last_heartbeat_at is touched (throttled to one write per 10s, the same
@@ -436,6 +468,20 @@ sittingRouter.post('/simulate', async (req, res) => {
 // All fields are optional (a bare heartbeat-only POST is still valid) and
 // `timestamp` is accepted but ignored: the server clock stays the source of
 // truth for all session timing.
+//
+// `stateForMs` (device-derived, optional) says how long the reported state has
+// been continuously measured — when its confirmation window BEGAN. On the
+// transition POSTs the route anchors session timing to that first-detection
+// moment instead of the arrival moment, so the firmware's 5 s sitting / 10 s
+// vacancy confirmation windows never inflate the recorded sitting duration:
+//   - sitting snapshot → setPosture/openSession with started_at = first
+//     detection of sitting (after a resumed contact gap the value is clamped
+//     to the device's previous contact, never backdating over an
+//     already-closed session)
+//   - vacant snapshot  → closeActiveSession with ended_at = first detection
+//     of vacancy (clamped to [started_at, now] in the session service)
+// Missing/garbage-free older payloads without the field keep the previous
+// server-"now" behavior.
 // ─────────────────────────────────────────────────────────────
 sittingRouter.post('/heartbeat', requireDeviceToken, async (req, res) => {
   if (!isSupabaseConfigured()) {
@@ -467,20 +513,33 @@ sittingRouter.post('/heartbeat', requireDeviceToken, async (req, res) => {
     }
   }
 
+  let stateForMs: number | undefined;
+  if (body.stateForMs !== undefined) {
+    stateForMs = Number(body.stateForMs);
+    if (!Number.isFinite(stateForMs) || stateForMs < 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'stateForMs must be a non-negative number when present',
+      });
+    }
+  }
+
   if (body.timestamp !== undefined && !Number.isFinite(Number(body.timestamp))) {
     return res.status(400).json({ success: false, error: 'timestamp must be a number when present' });
   }
 
   try {
     // 1. Cache the reading for /status (in-memory only, never stored in the DB)
-    recordTelemetry(deviceId, distance);
+    const { resumedAfterGap, previousContactAt } = recordTelemetry(deviceId, distance);
 
     // 2. Edge-detect the state snapshot → session lifecycle via the shared service
     if (state !== undefined && getLastKnownState(deviceId) !== state) {
       setLastKnownState(deviceId, state);
 
       if (state === 'vacant') {
-        const result = await closeActiveSession();
+        // Anchor the close to when vacancy was FIRST detected (true stand-up
+        // moment), not when the confirmation completed / snapshot arrived
+        const result = await closeActiveSession(firstDetectedAt(stateForMs, null));
         switch (result.status) {
           case 'stopped':
             console.log(
@@ -496,7 +555,12 @@ sittingRouter.post('/heartbeat', requireDeviceToken, async (req, res) => {
             return res.status(500).json({ success: false, error: result.error });
         }
       } else {
-        const result = await setPosture(state);
+        // Anchor the open to when sitting was FIRST detected (true sit-down
+        // moment), not when the confirmation completed / snapshot arrived.
+        // After a resumed contact gap the backdate is clamped to the device's
+        // previous contact so it never overlaps an already-closed session.
+        const startedAt = firstDetectedAt(stateForMs, resumedAfterGap ? previousContactAt : null);
+        const result = await setPosture(state, startedAt);
         switch (result.status) {
           case 'updated':
             console.log(

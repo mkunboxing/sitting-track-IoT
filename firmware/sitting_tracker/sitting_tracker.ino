@@ -18,12 +18,17 @@
  *                                           |
  *                                          GND
  *
- * Logic & Timing Specifications (posture tracking):
+ * Logic & Timing Specifications (posture tracking — thresholds + debounce live
+ * in debounce.h, shared with the host-side test suite):
  *   - RELAX_ENTER_CM     = 8 cm   (distance < threshold is relaxing)
  *   - ATTENTIVE_ENTER_CM = 8.5 cm (8–8.5 cm is a deadband: hold previous state)
  *   - OCCUPANCY_LIMIT_CM = 45 cm  (distance <= threshold is occupied)
- *   - OCCUPIED_CONFIRM   = 2000 ms continuous detection to confirm relaxing/attentive
- *   - VACANT_CONFIRM     = 5000 ms continuous detection to confirm vacant
+ *   - SIT_START_CONFIRM  = 5000 ms continuous sitting to confirm vacant →
+ *                          occupied (the session OPENS on that snapshot)
+ *   - SIT_END_CONFIRM    = 10000 ms continuous vacant to confirm occupied →
+ *                          vacant (the session CLOSES on that snapshot)
+ *   - POSTURE_CONFIRM    = 2000 ms continuous to confirm relaxing ↔ attentive
+ *                          (posture switch only — never opens/closes a session)
  *   - SENSOR_INTERVAL    = 700 ms  (ultrasonic ping interval)
  *
  * Communication (HTTP telemetry — replaces the old persistent WebSocket):
@@ -31,7 +36,13 @@
  *       POST /api/sitting/heartbeat
  *       Authorization: Bearer <DEVICE_TOKEN>
  *       { "deviceId": "sitting-tracker-01", "distance": 10.5,
- *         "state": "relaxing|attentive|vacant", "timestamp": <epoch secs> }
+ *         "state": "relaxing|attentive|vacant", "timestamp": <epoch secs>,
+ *         "stateForMs": <ms the reported state has been continuously
+ *                        measured, i.e. since its confirmation window began> }
+ *     The backend uses `stateForMs` to anchor session started_at/ended_at to
+ *     FIRST DETECTION of the new state (true sit-down / stand-up moments) so
+ *     the 5 s / 10 s confirmation windows never inflate the recorded sitting
+ *     duration.
  *   - Each request IS the device's last-contact/heartbeat signal: the backend
  *     touches last_heartbeat_at and auto-closes the session via its stale
  *     check if the snapshots stop arriving (power-off, Wi-Fi loss).
@@ -52,6 +63,10 @@
 #include <WiFiClientSecure.h>
 #include <BearSSLHelpers.h>
 #include <time.h>
+
+// Pure seating-state machine (thresholds, confirmation windows, debounce) —
+// shared verbatim with firmware/tests/debounce_test.cpp
+#include "debounce.h"
 
 // ==============================================================================
 // 1. CONFIGURATION: Wi-Fi, Backend API, and Device Identity
@@ -154,17 +169,16 @@ const char* DEVICE_TOKEN = "515e0200-a088-4c67-b6fc-3dc9cfb941d3";
 const int PIN_TRIG = 12; // D6
 const int PIN_ECHO = 14; // D5
 
-// Posture Detection Thresholds
+// Posture Detection Thresholds & Confirmation Windows — defined in debounce.h
 //   distance <  8      → RELAXING
 //   8 … 8.5            → deadband: keep the previous state (hysteresis, so
 //                        readings hovering at the boundary don't flap)
 //   8.5 < distance ≤ 45 → ATTENTIVE
 //   distance > 45 or invalid → VACANT (desk unoccupied)
-const float RELAX_ENTER_CM          = 8.0;   // Distance < 8 cm is relaxing
-const float ATTENTIVE_ENTER_CM      = 8.5;   // Distance > 8.5 cm (and <= 45) is attentive
-const float OCCUPANCY_LIMIT_CM      = 45.0;  // Distance > 45 cm is vacant
-const unsigned long OCCUPIED_CONFIRM = 2000; // 2000 ms continuous to confirm relaxing/attentive
-const unsigned long VACANT_CONFIRM   = 5000; // 5000 ms continuous to confirm vacant
+//
+// Session confirmation is transition-dependent (SIT_START_CONFIRM 5 s of
+// continuous sitting opens a session, SIT_END_CONFIRM 10 s of continuous
+// vacant closes it, POSTURE_CONFIRM 2 s only switches relaxing ↔ attentive).
 const unsigned long SENSOR_INTERVAL = 700;   // 700 ms between sensor readings
 
 // Telemetry cadence: one HTTP POST carrying distance + current state every
@@ -179,21 +193,16 @@ const unsigned long TELEMETRY_INTERVAL_MS = 2500;
 const unsigned long HTTP_RESPONSE_TIMEOUT_MS = 5000;
 
 // ==============================================================================
-// 3. STATE DEFINITIONS
+// 3. STATE DEFINITIONS (enum State comes from debounce.h)
 // ==============================================================================
 
-enum State {
-  STATE_VACANT,
-  STATE_RELAXING,
-  STATE_ATTENTIVE
-};
-
-// Current confirmed state
-State currentState = STATE_VACANT;
-
-// Potential state being evaluated for debounce
-State potentialState = STATE_VACANT;
-unsigned long potentialStateStartTime = 0;
+// Debounced seating state machine: `current` is the confirmed state reported
+// by telemetry; `potential` accumulates continuous confirmation time toward a
+// transition (windows: SIT_START_CONFIRM / SIT_END_CONFIRM / POSTURE_CONFIRM);
+// `currentSince` is when `current` was first continuously measured (telemetry
+// `stateForMs` — lets the backend exclude confirmation windows from the
+// recorded sitting duration).
+DebounceState debounce = { STATE_VACANT, STATE_VACANT, 0, 0 };
 
 // Backend HTTP client — one persistent TLS/plain connection reused across
 // telemetry POSTs (a single handshake is amortized, like the old WebSocket).
@@ -283,18 +292,19 @@ void setup() {
   Serial.print(initialDistance);
   Serial.println(F(" cm"));
 
-  // Same classification as loop(): < 8 relaxing, 8–8.5 deadband (treat as
-  // attentive on boot), 8.5–45 attentive, > 45 / invalid vacant
-  if (initialDistance > 0 && initialDistance <= OCCUPANCY_LIMIT_CM) {
-    potentialState = (initialDistance < RELAX_ENTER_CM) ? STATE_RELAXING : STATE_ATTENTIVE;
-  } else {
-    potentialState = STATE_VACANT;
-    currentState = STATE_VACANT;
+  // Same classification as loop() (classifyDistance): < 8 relaxing, 8–8.5
+  // deadband (treat as attentive on boot), 8.5–45 attentive, > 45 / invalid
+  // vacant. Current state starts vacant, so a desk occupied at boot still
+  // needs SIT_START_CONFIRM of continuous sitting before a session opens.
+  debounce.current = STATE_VACANT;
+  debounce.potential = classifyDistance(initialDistance, debounce.current);
+  if (debounce.potential == STATE_VACANT) {
     // Startup safety check: if a session is dangling from a previous power-off,
     // the first "vacant" telemetry POST closes it on the server.
     Serial.println(F("[INIT] Desk vacant on boot. Current state (vacant) is sent with the next telemetry POST."));
   }
-  potentialStateStartTime = millis();
+  debounce.potentialSince = millis();
+  debounce.currentSince = debounce.potentialSince; // current (vacant) held since boot
 
   Serial.println(F("[INIT] Setup complete. Monitoring desk..."));
 }
@@ -327,47 +337,28 @@ void loop() {
       Serial.print(F(" cm"));
     }
     Serial.print(F(" | Current: "));
-    Serial.print(stateName(currentState));
+    Serial.print(stateName(debounce.current));
 
-    // Determine instantaneous posture (with 8–8.5 cm hysteresis deadband):
-    //   Valid distance < 8 cm              → relaxing
-    //   Distance in the 8–8.5 cm deadband  → hold the current state (a vacant
-    //                                        device reads the deadband as attentive)
-    //   8.5 cm < distance <= 45 cm         → attentive
-    //   Distance > 45 cm or negative (no echo / out of range) → vacant
-    State measuredState;
-    if (distance <= 0 || distance > OCCUPANCY_LIMIT_CM) {
-      measuredState = STATE_VACANT;
-    } else if (distance < RELAX_ENTER_CM) {
-      measuredState = STATE_RELAXING;
-    } else if (distance > ATTENTIVE_ENTER_CM) {
-      measuredState = STATE_ATTENTIVE;
-    } else {
-      measuredState = (currentState == STATE_VACANT) ? STATE_ATTENTIVE : currentState;
-    }
+    // Instantaneous posture classification with the 8–8.5 cm hysteresis
+    // deadband (see classifyDistance in debounce.h), then debounced with a
+    // transition-dependent confirmation window: 5 s of continuous sitting to
+    // leave vacant (opens a session), 10 s of continuous vacant to leave
+    // sitting (closes a session), 2 s for a relaxing ↔ attentive switch
+    // (posture only). A fluctuation restarts the pending window, so momentary
+    // readings never confirm a transition.
+    State measuredState = classifyDistance(distance, debounce.current);
+    DebounceEvent event = updateDebounce(debounce, measuredState, now);
 
-    // Check if the measured state is different from potential state being debounced
-    if (measuredState != potentialState) {
-      // Physical measurement shifted; reset confirmation timer
-      potentialState = measuredState;
-      potentialStateStartTime = now;
+    if (event == DEBOUNCE_RESET) {
       Serial.print(F(" -> Potential shift to: "));
-      Serial.print(stateName(potentialState));
-    } else {
-      // Measured state matches potential state; check if threshold duration reached
-      unsigned long duration = now - potentialStateStartTime;
-      unsigned long requiredDuration = (potentialState == STATE_VACANT) ? VACANT_CONFIRM : OCCUPIED_CONFIRM;
-
-      if (duration >= requiredDuration && potentialState != currentState) {
-        // State change is confirmed. Nothing to transmit here — the next
-        // telemetry POST (≤ 2.5s away) carries the new current state.
-        Serial.println();
-        Serial.print(F(">>> [STATE CHANGED] Confirmed transition to: "));
-        Serial.print(stateName(potentialState));
-        Serial.println(F(" (sent with next telemetry POST)"));
-
-        currentState = potentialState;
-      }
+      Serial.print(stateName(debounce.potential));
+    } else if (event == DEBOUNCE_CONFIRMED) {
+      // State change is confirmed. Nothing to transmit here — the next
+      // telemetry POST (≤ 2.5s away) carries the new current state.
+      Serial.println();
+      Serial.print(F(">>> [STATE CHANGED] Confirmed transition to: "));
+      Serial.print(stateName(debounce.current));
+      Serial.println(F(" (sent with next telemetry POST)"));
     }
 
     Serial.println();
@@ -468,9 +459,9 @@ bool postTelemetry() {
 
   char body[160];
   snprintf(body, sizeof(body),
-           "{\"deviceId\":\"%s\",\"distance\":%.1f,\"state\":\"%s\",\"timestamp\":%lu}",
-           DEVICE_ID, lastMeasuredDistanceCm, stateName(currentState),
-           (unsigned long)time(nullptr));
+           "{\"deviceId\":\"%s\",\"distance\":%.1f,\"state\":\"%s\",\"timestamp\":%lu,\"stateForMs\":%lu}",
+           DEVICE_ID, lastMeasuredDistanceCm, stateName(debounce.current),
+           (unsigned long)time(nullptr), (unsigned long)(millis() - debounce.currentSince));
 
   char request[512];
   int requestLen = snprintf(request, sizeof(request),
@@ -534,7 +525,7 @@ bool postTelemetry() {
 
   if (httpCode >= 200 && httpCode < 300) {
     Serial.print(F("[API] Telemetry POST: "));
-    Serial.print(stateName(currentState));
+    Serial.print(stateName(debounce.current));
     Serial.print(F(" @ "));
     Serial.print(lastMeasuredDistanceCm, 1);
     Serial.print(F(" cm → HTTP "));

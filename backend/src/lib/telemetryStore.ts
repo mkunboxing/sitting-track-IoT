@@ -44,15 +44,24 @@ const lastHeartbeatWrites = new Map<string, number>();
  * Record a telemetry snapshot from a device. `distanceCm` may be omitted
  * (heartbeat-only POST) — the previous reading is kept.
  *
- * Returns `resumedAfterGap: true` when this snapshot ends a contact gap
- * longer than DEVICE_ONLINE_WINDOW_MS (device was silent ≥ 30s — power loss,
- * Wi-Fi down, backend outage). In that case the device's remembered state is
- * cleared so the route treats its next snapshot as a fresh transition — the
- * HTTP equivalent of the old WebSocket reconnect state-sync. Without this, a
- * device that returned still-sitting after the stale-check closed its session
- * would never re-open one.
+ * Returns:
+ * - `resumedAfterGap: true` when this snapshot ends a contact gap longer than
+ *   DEVICE_ONLINE_WINDOW_MS (device was silent ≥ 30s — power loss, Wi-Fi down,
+ *   backend outage). In that case the device's remembered state is cleared so
+ *   the route treats its next snapshot as a fresh transition — the HTTP
+ *   equivalent of the old WebSocket reconnect state-sync. Without this, a
+ *   device that returned still-sitting after the stale-check closed its
+ *   session would never re-open one.
+ * - `previousContactAt`: epoch ms of the device's previous snapshot (null on
+ *   first contact). On a resumed gap this is where the device was last heard —
+ *   the route uses it as the lower bound when backdating a session start, so
+ *   a device returning still-sitting never backdates a new session into time
+ *   already covered (and possibly still recorded) by the previous one.
  */
-export function recordTelemetry(deviceId: string, distanceCm?: number): { resumedAfterGap: boolean } {
+export function recordTelemetry(
+  deviceId: string,
+  distanceCm?: number
+): { resumedAfterGap: boolean; previousContactAt: number | null } {
   const now = new Date();
   const previous = readings.get(deviceId);
   const lastContactAt = now.getTime();
@@ -69,7 +78,7 @@ export function recordTelemetry(deviceId: string, distanceCm?: number): { resume
     lastContactAt,
   });
 
-  return { resumedAfterGap };
+  return { resumedAfterGap, previousContactAt: previous?.lastContactAt ?? null };
 }
 
 /**

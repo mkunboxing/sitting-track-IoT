@@ -75,8 +75,16 @@ export function currentPostureStretchSeconds(session: PostureSessionRow, now: Da
 /**
  * Open a sitting session if one does not already exist, starting it in the
  * given posture. Mirrors the previous POST /api/sitting/start logic exactly.
+ *
+ * `startedAt` overrides the server "now" for started_at/posture_changed_at —
+ * the device's confirmed-state first-detection moment, so the firmware's
+ * sitting-confirmation window doesn't inflate the recorded duration. Callers
+ * without a device-derived moment (dashboard simulate controls) omit it.
  */
-export async function openSession(posture: PostureState = 'attentive'): Promise<OpenSessionResult> {
+export async function openSession(
+  posture: PostureState = 'attentive',
+  startedAt?: Date
+): Promise<OpenSessionResult> {
   const supabase = getSupabaseServerClient();
 
   try {
@@ -98,17 +106,18 @@ export async function openSession(posture: PostureState = 'attentive'): Promise<
       return { status: 'already_active', session: existingActive, reason: 'pre_existing' };
     }
 
-    // 3. Create new session with current server timestamp
-    const nowIso = new Date().toISOString();
+    // 3. Create new session (server clock unless a device-derived start is given;
+    //    the posture stretch begins with the session so no time goes unclassified)
+    const startIso = (startedAt ?? new Date()).toISOString();
     const { data: newSession, error: insertError } = await supabase
       .from('sitting_sessions')
       .insert([
         {
-          started_at: nowIso,
+          started_at: startIso,
           ended_at: null,
           duration_seconds: null,
           posture_state: posture,
-          posture_changed_at: nowIso,
+          posture_changed_at: startIso,
           relax_seconds: 0,
           attentive_seconds: 0,
         },
@@ -146,9 +155,10 @@ export async function openSession(posture: PostureState = 'attentive'): Promise<
 /**
  * Transition the active session to a new posture, flushing the completed
  * stretch into the per-posture columns. Opens a session when the device
- * reports a posture while vacant (e.g. straight into relaxing).
+ * reports a posture while vacant (e.g. straight into relaxing) — `startedAt`
+ * backdates that open to the device's first-detection moment (see openSession).
  */
-export async function setPosture(posture: PostureState): Promise<SetPostureResult> {
+export async function setPosture(posture: PostureState, startedAt?: Date): Promise<SetPostureResult> {
   const supabase = getSupabaseServerClient();
 
   try {
@@ -166,7 +176,7 @@ export async function setPosture(posture: PostureState): Promise<SetPostureResul
 
     // Posture reported while vacant — start tracking in that posture
     if (!activeSession) {
-      const opened = await openSession(posture);
+      const opened = await openSession(posture, startedAt);
       if (opened.status === 'db_error') return opened;
       if (opened.status === 'started') return { status: 'updated', session: opened.session };
       return { status: 'unchanged', session: opened.session };
@@ -216,11 +226,16 @@ export async function setPosture(posture: PostureState): Promise<SetPostureResul
 }
 
 /**
- * Close the active sitting session, computing duration from server time.
- * The running posture stretch is flushed first so relax/attentive totals
- * cover the full session. Mirrors the previous POST /api/sitting/stop logic.
+ * Close the active sitting session. Mirrors the previous POST /api/sitting/stop
+ * logic, with optional device-derived timing: `endedAt` backdates the close to
+ * the vacancy first-detection moment so the firmware's vacancy-confirmation
+ * window doesn't inflate the recorded duration. It is clamped to
+ * [started_at, now] so a bogus device value can never produce a negative or
+ * future-ended session. The running posture stretch is flushed up to the
+ * (possibly backdated) end so confirmation-window time never counts as
+ * relax/attentive either.
  */
-export async function closeActiveSession(): Promise<CloseSessionResult> {
+export async function closeActiveSession(endedAt?: Date): Promise<CloseSessionResult> {
   const supabase = getSupabaseServerClient();
 
   try {
@@ -242,13 +257,12 @@ export async function closeActiveSession(): Promise<CloseSessionResult> {
       return { status: 'no_active_session' };
     }
 
-    // 3. Server is the source of truth for timestamps
-    const stopTime = new Date();
-    const startTime = new Date(activeSession.started_at);
-    const durationSeconds = Math.max(
-      0,
-      Math.floor((stopTime.getTime() - startTime.getTime()) / 1000)
-    );
+    // 3. Server is the source of truth for the clock; the device-derived end
+    //    moment only shifts the timestamp back within [started_at, now].
+    const startMs = new Date(activeSession.started_at).getTime();
+    const stopMs = Math.min(Math.max(endedAt?.getTime() ?? Date.now(), startMs), Date.now());
+    const stopTime = new Date(stopMs);
+    const durationSeconds = Math.max(0, Math.floor((stopMs - startMs) / 1000));
 
     // Flush the running posture stretch up to the stop time
     const { relaxSeconds, attentiveSeconds } = accumulatePosture(activeSession, stopTime);
