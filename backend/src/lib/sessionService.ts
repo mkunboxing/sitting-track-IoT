@@ -4,9 +4,9 @@ import type { PostureState, SittingSession } from '../types/sitting';
 
 /**
  * Session lifecycle service — the single source of truth for opening and
- * closing sitting sessions. Shared by the HTTP routes (device telemetry on
- * POST /heartbeat, dashboard controls on /simulate) so every transport
- * behaves identically.
+ * closing sitting sessions. Shared by the MQTT telemetry subscriber
+ * (lib/mqttClient.ts → lib/telemetryProcessor.ts) and the dashboard controls
+ * on /simulate so every caller behaves identically.
  *
  * Atomicity: the database's partial unique index
  * (idx_sitting_sessions_one_active, WHERE ended_at IS NULL) guarantees at

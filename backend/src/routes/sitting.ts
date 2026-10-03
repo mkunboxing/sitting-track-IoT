@@ -1,6 +1,5 @@
 import { Router } from 'express';
 import { getSupabaseServerClient, isSupabaseConfigured } from '../lib/supabase';
-import { requireDeviceToken } from '../lib/auth';
 import { eventBroadcaster } from '../lib/eventBroadcaster';
 import {
   openSession,
@@ -10,7 +9,6 @@ import {
   currentPostureStretchSeconds,
 } from '../lib/sessionService';
 import { DEVICE_ONLINE_WINDOW_MS, getLatestSensorReading } from '../lib/telemetryStore';
-import { parseTelemetryPayload, processDeviceTelemetry } from '../lib/telemetryProcessor';
 import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '../lib/timeUtils';
 import type { DashboardStatsResponse, DayStats, SittingSession } from '../types/sitting';
 
@@ -134,7 +132,7 @@ sittingRouter.get('/status', async (req, res) => {
 
       const timeSinceCheck = now.getTime() - lastCheckTime;
       // If module has been silent for > 30 seconds (and heartbeat was established) or > 8 hours (stale safety).
-      // The device's HTTP telemetry (POST /heartbeat, every 2.5s) touches
+      // The device's MQTT telemetry (snapshot every 2.5s via EMQX Cloud) touches
       // last_heartbeat_at every 10s, so a live device never trips this; it
       // only fires for a genuinely gone device.
       const isStaleHeartbeat = activeSession.last_heartbeat_at && timeSinceCheck > 30 * 1000;
@@ -405,61 +403,3 @@ sittingRouter.post('/simulate', async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────────────────────
-// POST /heartbeat — device telemetry over HTTP (kept during the MQTT
-// migration alongside the EMQX Cloud subscriber in lib/mqttClient.ts).
-//
-// The ESP8266 POSTs a seating-state snapshot every 2.5s:
-//   Authorization: Bearer <DEVICE_TOKEN>
-//   { "deviceId": "sitting-tracker-01", "distance": 10.5,
-//     "state": "attentive", "timestamp": 1234567890 }
-//
-// This route is now a thin HTTP adapter: auth (Bearer DEVICE_TOKEN) →
-// deviceId (advisory; defaults to "default") → parseTelemetryPayload (same
-// validation as the MQTT path) → processDeviceTelemetry — the shared
-// pipeline in lib/telemetryProcessor.ts that the MQTT subscriber feeds too.
-// There, each snapshot is: cached for /status (in-memory) → edge-detected
-// against the device's last known state → routed to the shared
-// sessionService only on actual transitions (relaxing/attentive → setPosture,
-// vacant → closeActiveSession, with session timing anchored to the
-// device-derived `stateForMs` first-detection moment) → last_heartbeat_at
-// touched (throttled to one write per 10s) so the /status stale-check keeps
-// working unchanged.
-//
-// Because identical snapshots are idempotent in the shared pipeline, it is
-// safe for the device to send the same snapshot over BOTH transports during
-// the migration — the second copy no-ops.
-//
-// `timestamp` is accepted but ignored: the server clock stays the source of
-// truth for all session timing.
-// ─────────────────────────────────────────────────────────────
-sittingRouter.post('/heartbeat', requireDeviceToken, async (req, res) => {
-  if (!isSupabaseConfigured()) {
-    return res.status(503).json({ success: false, error: 'Database not configured.' });
-  }
-
-  const body = (req.body ?? {}) as Record<string, unknown>;
-
-  // deviceId is advisory (key for the in-memory maps / /health display); the
-  // Bearer token is the actual authentication. Trim + cap like the old WS auth.
-  const deviceId =
-    typeof body.deviceId === 'string' && body.deviceId.trim().length > 0
-      ? body.deviceId.trim().slice(0, 64)
-      : 'default';
-
-  const parsed = parseTelemetryPayload(body);
-  if (!parsed.ok) {
-    return res.status(400).json({ success: false, error: parsed.error });
-  }
-
-  const result = await processDeviceTelemetry(deviceId, parsed.snapshot, 'http');
-  if (!result.ok) {
-    return res.status(500).json({ success: false, error: result.error });
-  }
-
-  return res.json({
-    success: true,
-    deviceId,
-    timestamp: new Date().toISOString(),
-  });
-});

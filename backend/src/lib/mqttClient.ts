@@ -3,33 +3,30 @@ import { markDeviceOffline } from './telemetryStore';
 import { parseTelemetryPayload, processDeviceTelemetry } from './telemetryProcessor';
 
 /**
- * MQTT subscriber (EMQX Cloud) — the device-telemetry transport that runs
- * alongside the HTTP POST /heartbeat during the migration.
+ * MQTT subscriber (EMQX Cloud) — the device-telemetry transport.
  *
  *   ESP8266 ──MQTT over TLS (8883)──► EMQX Cloud ◄──MQTT over TLS── this backend
  *
  * The device publishes:
- *   - snapshots to `sitting/device/<deviceId>/telemetry` (same JSON fields as
- *     the HTTP heartbeat body: deviceId, distance, state, timestamp, stateForMs)
+ *   - snapshots to `sitting/device/<deviceId>/telemetry`
+ *     (deviceId, distance, state, timestamp, stateForMs)
  *   - a retained "online" to `sitting/device/<deviceId>/status` on every
  *     connect, with a retained Last-Will-and-Testament "offline" that the
  *     broker publishes for it if the device vanishes without a clean
  *     disconnect (power-off, Wi-Fi loss).
  *
  * This backend subscribes with wildcards and feeds every telemetry message
- * into the SAME pipeline as the HTTP heartbeat (parseTelemetryPayload →
- * processDeviceTelemetry), so session detection, stateForMs backdating,
- * heartbeat throttling and stale-check behavior are identical — and since
- * identical snapshots are idempotent there, having both transports deliver
- * the same snapshot during the transition is safe (the second one no-ops).
+ * into the shared pipeline (parseTelemetryPayload → processDeviceTelemetry),
+ * so session detection, stateForMs backdating, heartbeat throttling and
+ * stale-check behavior are all driven from here.
  *
  * An LWT "offline" marks the device offline in the in-memory telemetry store
- * (cached reading dropped, remembered state cleared) — the exact state the
- * HTTP 30 s contact gap produces; the active session, if any, is still
- * closed by the existing /status stale-check at last-contact time.
+ * (cached reading dropped, remembered state cleared) — the same state a 30 s
+ * telemetry silence produces; the active session, if any, is still closed by
+ * the existing /status stale-check at last-contact time.
  *
  * Configuration (all via environment variables, see .env.example):
- *   MQTT_BROKER_URL       mqtts://<host>:8883   (unset → MQTT disabled, HTTP only)
+ *   MQTT_BROKER_URL       mqtts://<host>:8883   (unset → MQTT disabled)
  *   MQTT_USERNAME         broker credentials created in the EMQX Cloud console
  *   MQTT_PASSWORD
  *   MQTT_CLIENT_ID        optional, defaults to smart-tracking-backend-<pid>-<rand>
@@ -140,7 +137,7 @@ async function handleTelemetryMessage(topic: string, payload: Buffer, deviceId: 
     console.warn(`[MQTT] ${topic}: payload deviceId "${bodyDeviceId}" != topic deviceId "${deviceId}" — using topic`);
   }
 
-  const result = await processDeviceTelemetry(deviceId, parsed.snapshot, 'mqtt');
+  const result = await processDeviceTelemetry(deviceId, parsed.snapshot);
   if (!result.ok) {
     console.error(`[MQTT] ${topic}: telemetry processing failed — ${result.error}`);
   }

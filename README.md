@@ -7,7 +7,7 @@ The project is split into two apps:
 | App | Location | Role |
 | :--- | :--- | :--- |
 | **Frontend** | [`frontend/`](./frontend) | Next.js dashboard (static UI, calls the API server) |
-| **Backend** | [`backend/`](./backend) | Express (TypeScript) API + device HTTP telemetry endpoint + SSE streaming + Supabase access |
+| **Backend** | [`backend/`](./backend) | Express (TypeScript) API + MQTT device telemetry subscriber + SSE streaming + Supabase access |
 
 ---
 
@@ -23,10 +23,8 @@ The project is split into two apps:
 │  - Loop Delay: ~700ms           │
 └───────────────┬─────────────────┘
                 │
-                │ MQTT over TLS (primary): snapshot every 2.5s
+                │ MQTT over TLS: snapshot every 1.5s
                 │ sitting/device/<id>/telemetry + LWT status
-                │ (legacy HTTP POST /api/sitting/heartbeat kept
-                │  during the migration, removed after verification)
                 ▼
 ┌─────────────────────────────────┐
 │       EMQX Cloud (broker)       │
@@ -40,7 +38,6 @@ The project is split into two apps:
 │         Express API Server      │
 │         (backend/, TypeScript)  │
 │  - MQTT telemetry subscriber    │  ← device telemetry = heartbeat
-│  - POST /api/sitting/heartbeat  │  ← legacy HTTP telemetry (migration)
 │  - GET  /api/sitting/status     │
 │  - GET  /api/sitting/stream     │  ← SSE (session/posture events)
 │  - POST /api/sitting/simulate   │
@@ -105,41 +102,16 @@ topic: sitting/device/sitting-tracker-01/telemetry
 | `MQTT_STATUS_TOPIC` | `sitting/device/+/status` | LWT/online subscription |
 | `MQTT_CA_CERT` | *(Node's built-in roots)* | optional PEM bundle for private CAs (`\n` escapes unescaped) |
 
-### Legacy HTTP transport (removed after MQTT is verified)
+### How the backend processes each snapshot
 
-During the migration the firmware **also** POSTs the same snapshot every 2.5 s (this section describes what still exists today):
-
-**Exact URL:** `http://<backend-host>:4000/api/sitting/heartbeat` (dev) · `https://<backend-host>/api/sitting/heartbeat` (production)
-
-```json
-POST /api/sitting/heartbeat
-Authorization: Bearer <DEVICE_TOKEN>
-Content-Type: application/json
-
-{ "deviceId": "sitting-tracker-01", "distance": 10.5, "state": "attentive", "timestamp": 1234567890 }
-```
-
-- Authenticated with `Authorization: Bearer <DEVICE_TOKEN>` (invalid tokens get `401/403`, malformed bodies `400`).
-- **Heartbeat = the telemetry POST itself.** A device that stops posting goes stale, and the `/status` stale-check auto-closes any active session (~30 s) with `ended_at` = last-contact time.
-- **Backend unavailable:** sensing never stops. The device skips the POST, keeps classifying locally, and retries on the next 2.5 s cycle. Because every POST is a full *current-state snapshot* (not an event), the first successful POST after an outage reconciles everything.
-- **Live distance on the dashboard:** arrives via the dashboard's 2.5 s `GET /status` poll. SSE is used for instant *session* events (`STATUS_CHANGE` / `POSTURE_CHANGE`) so chimes and notifications fire immediately.
-
-### How the backend processes each snapshot (shared by both transports)
-
-1. **Validation:** `parseTelemetryPayload` enforces the same rules for MQTT messages as the HTTP route always did (error strings identical).
+1. **Validation:** `parseTelemetryPayload` validates every MQTT message (state vocabulary, numeric distance, non-negative `stateForMs`); invalid payloads are dropped with a log.
 2. **Telemetry cache (in-memory, never persisted):** the reading is stored and surfaced by `GET /status` as `distanceCm` + `distanceUpdatedAt`. Readings older than 30 s are reported as no-reading, so a powered-off device shows "waiting for sensor…" instead of a frozen distance.
 3. **Edge-detected session transitions:** the backend compares the snapshot's state with the device's last known state and calls the shared `sessionService` **only on actual changes** — `relaxing`/`attentive` → `setPosture` (opens a session when vacant), `vacant` → `closeActiveSession`. Unchanged snapshots are no-ops (no DB hit every 2.5 s), and manual dashboard controls are never overridden by the device's unchanged state.
 4. **Heartbeat:** each fresh contact touches `last_heartbeat_at` (throttled to one write per 10 s — the same rate the old WebSocket ping loop used), so the `/status` stale-check keeps working unchanged.
 
 ### Backend implementation
 
-`backend/src/lib/telemetryProcessor.ts` is the shared ingestion pipeline (validate → cache → edge-detect → `sessionService` → throttled heartbeat touch); the HTTP route (`POST /heartbeat`) and the MQTT subscriber (`backend/src/lib/mqttClient.ts`) are thin adapters over it. `backend/src/lib/telemetryStore.ts` holds the in-memory telemetry state (latest reading per device, last known state per device, heartbeat-write throttle, offline marking for MQTT LWT, online-device list for `/health`). Session open/close logic lives only in `backend/src/lib/sessionService.ts`, so MQTT telemetry, HTTP telemetry, the dashboard's manual controls, and the stale-check all behave identically.
-
-### Removing the HTTP heartbeat after verification
-
-Once MQTT is verified end-to-end (device + backend logs + EMQX dashboard):
-1. Firmware: set `USE_HTTP = false`, flash, re-verify, then delete the HTTP sections (config block, section 8 `HTTP TELEMETRY`, the `apiClient` globals) from `sitting_tracker.ino`.
-2. Backend: `POST /api/sitting/heartbeat` can then be deleted from `backend/src/routes/sitting.ts` (and `requireDeviceToken` if unused elsewhere).
+`backend/src/lib/telemetryProcessor.ts` is the ingestion pipeline (validate → cache → edge-detect → `sessionService` → throttled heartbeat touch); the MQTT subscriber (`backend/src/lib/mqttClient.ts`) is the only transport feeding it — the old HTTP `POST /heartbeat` route and its Bearer-token auth (`lib/auth.ts`, `DEVICE_TOKEN`) were **removed** once MQTT was verified. `backend/src/lib/telemetryStore.ts` holds the in-memory telemetry state (latest reading per device, last known state per device, heartbeat-write throttle, offline marking for MQTT LWT, online-device list for `/health`). Session open/close logic lives only in `backend/src/lib/sessionService.ts`, so MQTT telemetry, the dashboard's manual controls, and the stale-check all behave identically.
 
 ---
 
@@ -202,9 +174,10 @@ SUPABASE_URL=https://your-project-id.supabase.co
 # NEVER expose this key to the browser or client-side bundles.
 SUPABASE_SERVICE_ROLE_KEY=your_supabase_service_role_key
 
-# Shared Secret Device Token
-# The NodeMCU ESP8266 must include this in: "Authorization: Bearer <DEVICE_TOKEN>"
-DEVICE_TOKEN=tracker-secret-device-key-change-me
+# MQTT (EMQX Cloud) — the device telemetry transport
+MQTT_BROKER_URL=mqtts://your-deployment.ala.asia-southeast1.emqxsl.com:8883
+MQTT_USERNAME=your-emqx-username
+MQTT_PASSWORD=your-emqx-password
 
 # Express server
 PORT=4000
@@ -218,9 +191,6 @@ CORS_ORIGIN=http://localhost:3000
 # Base URL of the Express backend (empty = same origin)
 NEXT_PUBLIC_API_URL=http://localhost:4000
 ```
-
-> [!IMPORTANT]
-> The `DEVICE_TOKEN` is your authentication secret between your ESP8266 and the Express API. Keep it random and secure.
 
 ---
 
@@ -247,7 +217,7 @@ Open [http://localhost:3000](http://localhost:3000) in your browser. The dashboa
 ### Deploying
 
 - **Frontend (`frontend/`)** — deploys to Vercel. In the Vercel project settings, set **Root Directory = `frontend`** (Vercel auto-detects Next.js from there), and set the `NEXT_PUBLIC_API_URL` environment variable to the public URL of your Express server (it is inlined into the client bundle at build time), e.g. your Cloud Run URL.
-- **Backend (`backend/`)** — needs an **always-on host with HTTP streaming support for SSE** (Railway, Render, Fly.io, or a VPS all work; serverless platforms like Vercel Functions do **not** — they will not keep SSE connections open). The device protocol is plain request/response HTTP POSTs, so no WebSocket support is required. Build with `npm run build`, start with `npm start`, and set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEVICE_TOKEN`, `PORT`, and `CORS_ORIGIN` there — `CORS_ORIGIN=*` allows any origin (easy for dev), or list explicit origins comma-separated, e.g. `http://localhost:3000,https://smart-tracking.vercel.app` (recommended for production).
+- **Backend (`backend/`)** — needs an **always-on host with HTTP streaming support for SSE** (Railway, Render, Fly.io, or a VPS all work; serverless platforms like Vercel Functions do **not** — they will not keep SSE connections open). The device telemetry arrives via a persistent outbound MQTT connection to EMQX Cloud, so no WebSocket support is required. Build with `npm run build`, start with `npm start`, and set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `MQTT_BROKER_URL`, `MQTT_USERNAME`, `MQTT_PASSWORD`, `PORT`, and `CORS_ORIGIN` there — `CORS_ORIGIN=*` allows any origin (easy for dev), or list explicit origins comma-separated, e.g. `http://localhost:3000,https://smart-tracking.vercel.app` (recommended for production).
 
 #### Deploying the backend to Google Cloud Run
 
@@ -258,14 +228,13 @@ gcloud run deploy sitting-track-iot \
   --source backend \
   --region asia-south2 \
   --no-cpu-throttling \
-  --set-env-vars "SUPABASE_URL=…,SUPABASE_SERVICE_ROLE_KEY=…,DEVICE_TOKEN=…,CORS_ORIGIN=https://your-frontend.vercel.app"
+  --set-env-vars "SUPABASE_URL=…,SUPABASE_SERVICE_ROLE_KEY=…,MQTT_BROKER_URL=…,MQTT_USERNAME=…,MQTT_PASSWORD=…,CORS_ORIGIN=https://your-frontend.vercel.app"
 ```
 
 - **`--no-cpu-throttling`** — "CPU always allocated", so the SSE keepalive timer runs reliably even between HTTP requests.
-- The old `--timeout 3600` WebSocket workaround is **no longer needed** — device requests are short-lived POSTs that finish in milliseconds. (Cloud Run's default 300 s request timeout applies only to the dashboard's SSE connections, which the browser transparently reconnects.)
+- Device telemetry arrives via the backend's persistent outbound MQTT connection to EMQX Cloud — only the dashboard's SSE needs long-lived inbound connections (the browser transparently reconnects them).
 - The app honors Cloud Run's injected `PORT` automatically.
-- Scale-to-zero caveat: after an idle cold start, the first telemetry POST may be dropped while the instance boots; the ESP simply retries on its next 2.5 s cycle, and any session gap is handled by the stale-check.
-- ESP firmware for Cloud Run: `API_HOST = "<service>.run.app"`, `API_PORT = 443`, `USE_TLS = true` (the **GTS Root R1** PEM is already embedded in the sketch for full certificate validation).
+- Scale-to-zero caveat: after an idle cold start, the backend takes a few seconds to reconnect to EMQX Cloud and resume telemetry processing; any session gap in that window is handled by the stale-check.
 
 ---
 
@@ -284,7 +253,7 @@ The firmware source code is located in [`firmware/sitting_tracker/sitting_tracke
 5. Select **NodeMCU 1.0 (ESP-12E Module)** in **Tools > Board**.
 6. Set CPU Frequency: **80 MHz** or **160 MHz**, Upload Speed: **115200**.
 
-### Configuring the Backend API in the Firmware
+### Configuring the MQTT Broker in the Firmware
 
 Open [`firmware/sitting_tracker/sitting_tracker.ino`](./firmware/sitting_tracker/sitting_tracker.ino) and edit the configuration block:
 
@@ -302,16 +271,8 @@ const char*    MQTT_USERNAME  = "your-emqx-username";  // EMQX Cloud → Access 
 const char*    MQTT_PASSWORD  = "your-emqx-password";
 const char*    MQTT_CLIENT_ID = "sitting-tracker-01";  // unique per device
 
-// 3. Legacy HTTP heartbeat (kept until MQTT is verified; set USE_HTTP=false to disable)
-const char*    API_HOST = "192.168.1.120";
-const uint16_t API_PORT = 4000;
-const char*    API_PATH = "/api/sitting/heartbeat";
-const bool     USE_TLS  = false;   // true → https:// (GTS Root R4 CA is already embedded)
-const bool     USE_HTTP = true;
-
-// 4. Device identity + token (must match DEVICE_TOKEN in backend/.env)
-const char* DEVICE_ID    = "sitting-tracker-01";
-const char* DEVICE_TOKEN = "your-device-token";
+// 3. Device identity (the MQTT credentials above are the authentication)
+const char* DEVICE_ID = "sitting-tracker-01";
 ```
 
 > [!NOTE]
@@ -327,9 +288,8 @@ const char* DEVICE_TOKEN = "your-device-token";
    - NTP time sync (needed for TLS certificate validation + the timestamp field)
    - Continuous sensor readings every ~700ms
    - Debounce status and transition logs
-   - `[MQTT] Connected — status: online, LWT: offline` and `[MQTT] Telemetry: <state> @ <distance> cm` every 2.5s
-   - `[API] Telemetry POST: <state> @ <distance> cm → HTTP 200` every 2.5s (legacy HTTP, during the migration)
-   - `[MQTT] Connect failed (state …)` / `[API] Connect failed` when unreachable — retried automatically (MQTT reconnects are throttled to one attempt per 5 s)
+   - `[MQTT] Connected — status: online, LWT: offline` and `[MQTT] Telemetry: <state> @ <distance> cm` every telemetry cycle
+   - `[MQTT] Connect failed (state …)` when unreachable — retried automatically, throttled to one attempt per 5 s
 
 ---
 
@@ -339,11 +299,11 @@ const char* DEVICE_TOKEN = "your-device-token";
 | :--- | :--- |
 | **NodeMCU restarts while sitting** | The device's first telemetry snapshot carries its current state; the backend checks if an active session already exists — if yes, posture handling is idempotent and no duplicate session is created. |
 | **Duplicate state snapshots** | Idempotent design. The backend edge-detects state per device: unchanged snapshots (e.g. `attentive` every 2.5s while sitting) are safe no-ops with zero DB impact; `vacant` with no active session is a safe no-op. This also makes the MQTT + HTTP double-delivery during the migration harmless. |
-| **Device stops posting (power-off, Wi-Fi loss)** | MQTT: the broker fires the retained LWT `offline` (~22 s) and the backend marks the device offline in its store. HTTP: the telemetry POST *is* the heartbeat, so silence goes stale. Either way the `/status` stale-check closes the session (~30 s) with `ended_at` = last-contact time, and the dashboard shows "waiting for sensor…" once the last distance reading is >30 s old. |
+| **Device stops publishing (power-off, Wi-Fi loss)** | The broker fires the retained LWT `offline` (~22 s) and the backend marks the device offline in its store. The `/status` stale-check closes the session (~30 s) with `ended_at` = last-contact time, and the dashboard shows "waiting for sensor…" once the last distance reading is >30 s old. |
 | **MQTT broker unreachable / Wi-Fi down** | The device keeps sensing and retries (one MQTT attempt per 5 s, HTTP per cycle). Every transport message is a full current-state snapshot, so the first successful send after recovery reconciles everything — nothing is queued or replayed. |
 | **Backend unavailable / MQTT subscriber down** | mqtt.js reconnects every 5 s and re-subscribes; the retained LWT status survives backend restarts. Device-side behavior is unchanged — snapshots reconcile on the next send. |
 | **Session crossing midnight** | The statistics engine computes the mathematical intersection between any session `[started_at, ended_at]` and the day's boundaries `[00:00:00, 23:59:59]`. A session starting at 23:45 and ending at 00:30 correctly attributes 15m to yesterday and 30m to today. |
-| **Malformed / hostile HTTP requests** | Every device request is Bearer-authenticated (`401/403` on bad tokens) and body-validated (`400` on bad `state`/`distance`/`timestamp`). JSON parse errors are handled by a safe Express error handler that can never crash the server. MQTT payloads get the same validation; non-JSON/invalid messages are dropped with a log. |
+| **Malformed / hostile messages** | MQTT payloads are validated (state vocabulary, numeric distance, non-negative `stateForMs`); non-JSON/invalid messages are dropped with a log and can never crash the server. The dashboard API handles JSON parse errors with a safe Express error handler. |
 | **Server as single source of truth** | The device's `timestamp` field is informational only. Server clock (`new Date()`) sets `started_at`, `ended_at`, and `duration_seconds`. |
 | **Active Session Live Ticking** | The frontend uses `started_at` from the server to tick locally every second, preventing unnecessary database writes. |
 
@@ -351,33 +311,9 @@ const char* DEVICE_TOKEN = "your-device-token";
 
 ## 🧪 Testing
 
-### HTTP device simulator (no hardware needed)
-
-A device simulator is included at [`backend/scripts/device-simulator.mjs`](./backend/scripts/device-simulator.mjs). It mimics the real firmware: authenticated state-snapshot POSTs to `/api/sitting/heartbeat`. Run it from `backend/` (it reads `DEVICE_TOKEN` from `backend/.env`, or pass `--token=…`):
-
-```bash
-cd backend
-
-node scripts/device-simulator.mjs attentive  # open a session (one snapshot POST)
-node scripts/device-simulator.mjs attentive  # again → unchanged snapshot, no duplicate
-node scripts/device-simulator.mjs relax      # switch the active session to relaxing
-node scripts/device-simulator.mjs vacant     # close the session
-node scripts/device-simulator.mjs stream     # emulate the real device: POST every 2.5s (Ctrl+C to stop)
-node scripts/device-simulator.mjs crash      # one sitting snapshot, then go silent → stale-check closes the session (~30s after the next status poll)
-node scripts/device-simulator.mjs reconnect  # sit → 3s dropout → sit again → verifies no duplicate session
-node scripts/device-simulator.mjs sensor     # distance-only snapshots cycling every posture band (watch the dashboard)
-node scripts/device-simulator.mjs badtoken   # expect 401/403
-node scripts/device-simulator.mjs malformed  # invalid JSON/state → expect 400, server alive
-```
-
-Options: `--url=http://localhost:4000` · `--token=…` · `--id=sitting-tracker-01` · `--state=attentive` · `--distance=20.0` (for `stream`).
-
-> [!WARNING]
-> The simulator writes real sessions to whatever Supabase your backend points at. Don't run `attentive`/`vacant`/`crash`/`reconnect` while your real device is mid-session.
-
 ### MQTT device simulator (no hardware needed)
 
-An MQTT twin of the HTTP simulator lives at [`backend/scripts/mqtt-device-simulator.mjs`](./backend/scripts/mqtt-device-simulator.mjs). It connects to EMQX Cloud exactly like the firmware (TLS + username/password + LWT) and publishes the same snapshot JSON. Use it to verify the MQTT path **before reflashing the ESP8266**:
+A device simulator is included at [`backend/scripts/mqtt-device-simulator.mjs`](./backend/scripts/mqtt-device-simulator.mjs). It connects to EMQX Cloud exactly like the firmware (TLS + username/password + LWT) and publishes the same snapshot JSON:
 
 ```bash
 cd backend   # MQTT_BROKER_URL / MQTT_USERNAME / MQTT_PASSWORD come from backend/.env
@@ -393,26 +329,33 @@ node scripts/mqtt-device-simulator.mjs badjson    # non-JSON payload → dropped
 
 Options: `--url=mqtts://host:8883` · `--username=…` · `--password=…` · `--id=sitting-tracker-01` · `--state=…` · `--distance=…`.
 
-Verification checklist for the MQTT migration (run the backend locally with the MQTT env vars set):
+> [!WARNING]
+> The simulator writes real sessions to whatever Supabase your backend points at. Don't run `attentive`/`vacant`/`crash` while your real device is mid-session.
+
+What to check while the simulator runs (backend logs + dashboard):
 1. `[MQTT] Connected to broker — subscribing to sitting/device/+/telemetry + sitting/device/+/status` in the backend log.
 2. `stream` → `[TELEMETRY mqtt]` snapshot logs, dashboard distance + status updating.
 3. `vacant` → session closes with the device-derived `ended_at`.
 4. `crash` → ~22 s later, `[TELEMETRY] … marked offline (MQTT LWT / broker status)`, and the /status stale-check closes an active session at last contact as before.
 5. Check `GET /health` → `"mqtt": {"enabled": true, "connected": true, …}`.
 
-### HTTP endpoints via cURL
+### Host-side unit tests
+
+The firmware's seating state machine (`firmware/sitting_tracker/debounce.h`) is compiled and tested on the host — the exact header the ESP8266 runs:
 
 ```bash
-# Device telemetry endpoint (the firmware's only endpoint)
-curl -X POST http://localhost:4000/api/sitting/heartbeat \
-  -H "Authorization: Bearer your-device-token" \
-  -H "Content-Type: application/json" \
-  -d '{"deviceId":"sitting-tracker-01","distance":20.0,"state":"attentive","timestamp":1759500000}'
+c++ -std=c++17 -Wall -Wextra -I firmware/sitting_tracker \
+    firmware/tests/debounce_test.cpp -o /tmp/debounce_test && /tmp/debounce_test
+```
 
-# Dashboard endpoints
+Posture/time math helpers have their own test at `backend/scripts/posture-math-test.ts`.
+
+### Dashboard endpoints via cURL
+
+```bash
 curl http://localhost:4000/api/sitting/status
 
-# Gateway status: recently-online devices + SSE clients
+# Backend status: SSE clients + online devices + MQTT connection
 curl http://localhost:4000/health
 ```
 

@@ -9,16 +9,15 @@ import type { DeviceSeatingState } from './telemetryStore';
 
 /**
  * Shared device-telemetry pipeline — the single ingestion path for seating
- * state snapshots, whatever transport delivered them (HTTP POST /heartbeat,
- * MQTT via the EMQX Cloud subscriber). Every transport gets identical
- * semantics: validate → cache reading → edge-detect → sessionService →
- * throttled heartbeat touch. This module contains no session logic of its
- * own; session open/close/posture lives only in sessionService.ts.
+ * state snapshots arriving over MQTT (EMQX Cloud subscriber). Every message
+ * gets identical semantics: validate → cache reading → edge-detect →
+ * sessionService → throttled heartbeat touch. This module contains no
+ * session logic of its own; session open/close/posture lives only in
+ * sessionService.ts.
  *
  * Identical snapshots are idempotent here (edge detection compares against
- * the device's last known state), which is what makes running the HTTP and
- * MQTT transports in parallel during the migration safe: whichever copy of a
- * snapshot arrives second is a no-op.
+ * the device's last known state), so unchanged 2.5s snapshots are DB-free
+ * no-ops and manual dashboard controls are never overridden.
  */
 
 export interface DeviceTelemetrySnapshot {
@@ -33,9 +32,9 @@ export type ParsedTelemetry =
   | { ok: false; error: string };
 
 /**
- * Validate + normalize a telemetry payload. The exact rules (and error
- * strings) the HTTP heartbeat route has always enforced; `timestamp` is
- * accepted but ignored — the server clock stays the source of truth.
+ * Validate + normalize a telemetry payload (the same rules the MQTT
+ * subscriber enforces). `timestamp` is accepted but ignored — the server
+ * clock stays the source of truth.
  */
 export function parseTelemetryPayload(body: unknown): ParsedTelemetry {
   const payload = (body ?? {}) as Record<string, unknown>;
@@ -105,17 +104,15 @@ export type ProcessTelemetryResult =
   | { ok: false; error: string };
 
 /**
- * Process one telemetry snapshot through the full pipeline. `source` only
- * shapes the log prefix ("http" | "mqtt"). Returns `{ ok: false, error }`
- * instead of throwing so transports can map failures to their own error
- * reporting (HTTP status codes vs MQTT logs).
+ * Process one telemetry snapshot through the full pipeline. Returns
+ * `{ ok: false, error }` instead of throwing so the MQTT subscriber can log
+ * failures without crashing.
  */
 export async function processDeviceTelemetry(
   deviceId: string,
-  snapshot: DeviceTelemetrySnapshot,
-  source: 'http' | 'mqtt'
+  snapshot: DeviceTelemetrySnapshot
 ): Promise<ProcessTelemetryResult> {
-  const log = `[TELEMETRY ${source}]`;
+  const log = '[TELEMETRY mqtt]';
 
   try {
     // 1. Cache the reading for /status (in-memory only, never stored in the DB)

@@ -4,21 +4,24 @@ import type { PostureState } from '../types/sitting';
 export type DeviceSeatingState = PostureState | 'vacant';
 
 /**
- * Device telemetry store — in-memory state derived from the ESP8266's HTTP
- * telemetry POSTs (POST /api/sitting/heartbeat), replacing the old WebSocket
- * gateway's connection registry. Nothing here is ever written to the database.
+ * Device telemetry store — in-memory state derived from the ESP8266's MQTT
+ * telemetry snapshots (published to sitting/device/<id>/telemetry via EMQX
+ * Cloud, ingested by lib/mqttClient.ts). Nothing here is ever written to the
+ * database.
  *
  * Three responsibilities:
  * 1. Latest distance reading per device — surfaced by GET /status so the
  *    dashboard shows the last known distance immediately.
- * 2. Last known seating state per device — the route edge-detects the device's
- *    state snapshots against this, so sessionService is only called on actual
- *    transitions (keeps manual dashboard controls authoritative and avoids a
- *    Supabase query on every 2.5s snapshot).
- * 3. Last-contact tracking — the telemetry request IS the device's heartbeat:
- *    "online" means a snapshot arrived recently, and the route lets the fresh
- *    contact touch last_heartbeat_at at a throttled cadence (the /status
- *    stale-check keeps closing sessions when snapshots stop arriving).
+ * 2. Last known seating state per device — the MQTT subscriber edge-detects
+ *    the device's state snapshots against this, so sessionService is only
+ *    called on actual transitions (keeps manual dashboard controls
+ *    authoritative and avoids a Supabase query on every 2.5s snapshot).
+ * 3. Last-contact tracking — the telemetry snapshot IS the device's
+ *    heartbeat: "online" means a snapshot arrived recently, and the
+ *    subscriber lets the fresh contact touch last_heartbeat_at at a
+ *    throttled cadence (the /status stale-check keeps closing sessions when
+ *    snapshots stop arriving, and the MQTT LWT marks devices offline
+ *    immediately).
  */
 
 /** A device whose last snapshot is older than this is no longer "online". */
