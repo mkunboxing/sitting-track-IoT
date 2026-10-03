@@ -4,9 +4,9 @@ import type { PostureState, SittingSession } from '../types/sitting';
 
 /**
  * Session lifecycle service — the single source of truth for opening and
- * closing sitting sessions. Shared by the HTTP routes (/start, /stop,
- * /simulate) and the WebSocket device gateway so both transports behave
- * identically.
+ * closing sitting sessions. Shared by the HTTP routes (device telemetry on
+ * POST /heartbeat, dashboard controls on /simulate) so every transport
+ * behaves identically.
  *
  * Atomicity: the database's partial unique index
  * (idx_sitting_sessions_one_active, WHERE ended_at IS NULL) guarantees at
@@ -282,9 +282,9 @@ export async function closeActiveSession(): Promise<CloseSessionResult> {
 }
 
 /**
- * Liveness touch — keeps last_heartbeat_at fresh while a device is connected
- * via WebSocket. The /status endpoint's stale-session auto-close (30s/8h)
- * keeps working unchanged as a backstop.
+ * Liveness touch — keeps last_heartbeat_at fresh while a device keeps posting
+ * HTTP telemetry (throttled by the caller). The /status endpoint's
+ * stale-session auto-close (30s/8h) keeps working unchanged as a backstop.
  */
 export async function touchActiveSessionHeartbeat(): Promise<void> {
   if (!isSupabaseConfigured()) return;

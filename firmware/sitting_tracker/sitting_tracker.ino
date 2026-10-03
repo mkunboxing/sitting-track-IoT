@@ -26,29 +26,34 @@
  *   - VACANT_CONFIRM     = 5000 ms continuous detection to confirm vacant
  *   - SENSOR_INTERVAL    = 700 ms  (ultrasonic ping interval)
  *
- * Communication (WebSocket — replaces the old HTTP start/stop/heartbeat):
- *   - Persistent JSON WebSocket connection to the Node.js backend
- *   - Path: /ws/device  — first message must authenticate with DEVICE_TOKEN
- *   - On confirmed state transition: { "type": "state_change",
- *         "state": "relaxing" | "attentive" | "vacant" }
- *   - If offline during a transition: the CURRENT state is held locally and
- *     synced automatically right after the next successful authentication
- *     (never replays stale events — only the latest state is sent)
- *   - Liveness = WebSocket ping/pong (library heartbeat + server pings).
- *     The old HTTP heartbeat endpoint is no longer used. The backend treats
- *     an unexpected disconnect as the end of the sitting session.
+ * Communication (HTTP telemetry — replaces the old persistent WebSocket):
+ *   - Every 2.5s the device POSTs its CURRENT seating state + distance:
+ *       POST /api/sitting/heartbeat
+ *       Authorization: Bearer <DEVICE_TOKEN>
+ *       { "deviceId": "sitting-tracker-01", "distance": 10.5,
+ *         "state": "relaxing|attentive|vacant", "timestamp": <epoch secs> }
+ *   - Each request IS the device's last-contact/heartbeat signal: the backend
+ *     touches last_heartbeat_at and auto-closes the session via its stale
+ *     check if the snapshots stop arriving (power-off, Wi-Fi loss).
+ *   - Because every POST carries the full current state (not events), there is
+ *     nothing to queue or re-sync after an outage: if the backend is
+ *     unavailable the device simply keeps sensing, and the next successful
+ *     POST reconciles everything (the backend only acts on state CHANGES).
+ *   - TLS uses the embedded GTS Root R1 CA (full chain + hostname validation,
+ *     no setInsecure anywhere); NTP sync provides the clock both for
+ *     certificate validation and the timestamp field.
  *
- * Required Arduino library (install via Library Manager):
- *   "WebSockets" by Markus Sattler (Links2004) — version 2.x
+ * Required Arduino libraries: none beyond the ESP8266 core (built-in
+ * WiFiClientSecure). The old "WebSockets" library dependency is gone.
  * ==============================================================================
  */
 
 #include <ESP8266WiFi.h>
-#include <WebSocketsClient.h>
+#include <WiFiClientSecure.h>
 #include <time.h>
 
 // ==============================================================================
-// 1. CONFIGURATION: Wi-Fi, WebSocket Server, and Device Identity
+// 1. CONFIGURATION: Wi-Fi, Backend API, and Device Identity
 // ==============================================================================
 
 // ---------------------------------------------------------------------------
@@ -75,29 +80,29 @@ const int WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
 
 // ---------------------------------------------------------------------------
-// WebSocket server configuration (the Express backend, NOT the dashboard URL)
+// Backend API configuration (the Express backend, NOT the dashboard URL)
 //
 // Production — Google Cloud Run (TLS terminated by Google, port 443):
-//   wss://sitting-track-iot-1014206902177.asia-south2.run.app/ws/device
-//     WS_HOST = "sitting-track-iot-1014206902177.asia-south2.run.app"
-//     WS_PORT = 443, USE_TLS = true
-//     WS_CA_CERT = GTS Root R1 (already embedded below — full validation)
+//   https://sitting-track-iot-1014206902177.asia-south2.run.app/api/sitting/heartbeat
+//     API_HOST = "sitting-track-iot-1014206902177.asia-south2.run.app"
+//     API_PORT = 443, USE_TLS = true
+//     API_CA_CERT = GTS Root R1 (already embedded below — full validation)
 //
 // Local development (backend running on your computer — use your LAN IP):
-//   ws://192.168.1.12:4000/ws/device      → USE_TLS = false
+//   http://192.168.1.12:4000/api/sitting/heartbeat   → USE_TLS = false
 //     (find your computer's IP: macOS Wi-Fi → Option-click the icon)
 // ---------------------------------------------------------------------------
-const char*    WS_HOST    = "sitting-track-iot-1014206902177.asia-south2.run.app";
-const uint16_t WS_PORT    = 443;              // 443 for Cloud Run (wss), 4000 for local dev
-const char*    WS_PATH    = "/ws/device";
-const bool     USE_TLS    = true;             // true → wss:// (Cloud Run); false → local dev
+const char*    API_HOST = "sitting-track-iot-1014206902177.asia-south2.run.app";
+const uint16_t API_PORT = 443;                 // 443 for Cloud Run (https), 4000 for local dev
+const char*    API_PATH = "/api/sitting/heartbeat";
+const bool     USE_TLS  = true;                // true → https:// (Cloud Run); false → local dev
 
-// Root CA for production wss:// — GTS Root R1 (Google Trust Services), the
+// Root CA for production https:// — GTS Root R1 (Google Trust Services), the
 // trust anchor for *.run.app certificates. Self-signed, valid 2016–2036.
 // BearSSL validates the full chain (leaf → WR2 → this root) + hostname, so
 // no setInsecure() is used anywhere. NTP time sync runs in setup() because
 // certificate validity checks need a correct clock.
-const char* WS_CA_CERT =
+const char* API_CA_CERT =
   "-----BEGIN CERTIFICATE-----\n"
   "MIIFWjCCA0KgAwIBAgIQbkepxUtHDA3sM9CJuRz04TANBgkqhkiG9w0BAQwFADBH\n"
   "MQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExM\n"
@@ -130,7 +135,8 @@ const char* WS_CA_CERT =
   "E3PYJ/HQcu51OyLemGhmW/HGY0dVHLqlCFF1pkgl\n"
   "-----END CERTIFICATE-----\n";
 
-// This device's identity (reported to the backend; one live connection per ID)
+// This device's identity (sent in the telemetry payload; the Bearer token is
+// the actual authentication)
 const char* DEVICE_ID = "sitting-tracker-01";
 
 // Secret Device Authentication Token (must match DEVICE_TOKEN in backend/.env)
@@ -159,21 +165,16 @@ const unsigned long OCCUPIED_CONFIRM = 2000; // 2000 ms continuous to confirm re
 const unsigned long VACANT_CONFIRM   = 5000; // 5000 ms continuous to confirm vacant
 const unsigned long SENSOR_INTERVAL = 700;   // 700 ms between sensor readings
 
-// Live distance telemetry: send the latest reading to the dashboard every 2.5s
-// over the WebSocket ({"type":"sensor",...}). The backend caches it in memory
-// and pushes it to the dashboard via SSE — it is never stored in the database.
-const unsigned long SENSOR_SEND_INTERVAL_MS = 2500;
+// Telemetry cadence: one HTTP POST carrying distance + current state every
+// 2.5s. Each POST IS the device heartbeat — the backend treats a gap in these
+// posts as the device being gone and auto-closes the session via its
+// stale-check. Distance is cached in memory server-side and shown on the
+// dashboard; it is never stored in the database.
+const unsigned long TELEMETRY_INTERVAL_MS = 2500;
 
-// WebSocket keepalive: protocol-level ping every 15s, pong must arrive within
-// 3s; 2 missed pongs ⇒ the library drops the TCP connection and reconnects.
-// This replaces the old 30s HTTP heartbeat — it only detects stale
-// connections, it has nothing to do with sitting-time tracking.
-const unsigned long WS_PING_INTERVAL_MS = 15000;
-const unsigned long WS_PONG_TIMEOUT_MS  = 3000;
-const unsigned int  WS_DISCONNECT_COUNT = 2;
-
-// WebSocket reconnect pacing (avoid rapid reconnect loops)
-const unsigned long WS_RECONNECT_INTERVAL_MS = 5000;
+// HTTP timeouts: 5s to get a response, connection dropped when the server
+// stays quiet for 300ms after the status line (responses are tiny JSON).
+const unsigned long HTTP_RESPONSE_TIMEOUT_MS = 5000;
 
 // ==============================================================================
 // 3. STATE DEFINITIONS
@@ -192,13 +193,16 @@ State currentState = STATE_VACANT;
 State potentialState = STATE_VACANT;
 unsigned long potentialStateStartTime = 0;
 
-// WebSocket session state
-WebSocketsClient webSocket;
-bool wsAuthenticated = false; // true after the backend confirms authentication
+// Backend HTTP client — one persistent TLS/plain connection reused across
+// telemetry POSTs (a single handshake is amortized, like the old WebSocket).
+// If the server closes it (keep-alive timeout), the next POST re-handshakes.
+WiFiClientSecure tlsClient;
+WiFiClient plainClient;
+WiFiClient* apiClient = nullptr;
 
 // Timer for sensor reading loop
 unsigned long lastSensorReadTime = 0;
-unsigned long lastSensorSendTime = 0;      // live telemetry pacing
+unsigned long lastTelemetryPostTime = 0;   // telemetry POST pacing
 float lastMeasuredDistanceCm = -1.0;       // latest reading, sent as telemetry
 
 // ==============================================================================
@@ -207,12 +211,8 @@ float lastMeasuredDistanceCm = -1.0;       // latest reading, sent as telemetry
 
 float readDistanceCm();
 const char* stateName(State s);
-void sendStateChange(State newState);
-void sendSensorReading();
-void sendAuthenticate();
-void syncCurrentState();
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
-void handleServerMessage(char* msg, size_t length);
+bool ensureApiClientConnected();
+bool postTelemetry();
 void connectToWiFi();
 bool tryConnectToNetwork(const WifiCredential& net);
 
@@ -227,7 +227,7 @@ void setup() {
   Serial.println();
   Serial.println(F("========================================"));
   Serial.println(F("  Sitting Time Tracker - NodeMCU ESP8266"));
-  Serial.println(F("  Transport: WebSocket (persistent)"));
+  Serial.println(F("  Transport: HTTP telemetry (2.5s POST)"));
   Serial.println(F("========================================"));
 
   pinMode(PIN_TRIG, OUTPUT);
@@ -236,37 +236,36 @@ void setup() {
 
   connectToWiFi();
 
-  // --- WebSocket client setup (non-blocking; driven from loop()) ---
+  // --- Backend HTTP client setup ---
   if (USE_TLS) {
     // TLS certificate validation needs a correct clock — start NTP sync.
+    // (The clock also feeds the telemetry payload's timestamp field.)
     configTime(0, 0, "pool.ntp.org", "time.google.com");
-    if (strlen(WS_CA_CERT) > 0) {
-      Serial.print(F("[WS] Waiting for NTP time sync"));
+    if (strlen(API_CA_CERT) > 0) {
+      Serial.print(F("[NTP] Waiting for time sync"));
       unsigned long timeStart = millis();
       while (time(nullptr) < 1000000000 && millis() - timeStart < 10000) { // wait up to 10s
         delay(250);
         Serial.print(F("."));
       }
       Serial.println();
-      webSocket.beginSslWithCA(WS_HOST, WS_PORT, WS_PATH, WS_CA_CERT);
+      tlsClient.setCACert(API_CA_CERT);
     } else {
-      Serial.println(F("[WS] WARNING: USE_TLS=true but WS_CA_CERT is empty."));
-      Serial.println(F("[WS] Connecting with UNVALIDATED TLS (no server-identity check)."));
-      Serial.println(F("[WS] Paste the GTS Root R1 PEM into WS_CA_CERT for production."));
-      webSocket.beginSSL(WS_HOST, WS_PORT, WS_PATH);
+      Serial.println(F("[TLS] WARNING: USE_TLS=true but API_CA_CERT is empty."));
+      Serial.println(F("[TLS] Connecting with UNVALIDATED TLS (no server-identity check)."));
+      Serial.println(F("[TLS] Paste the GTS Root R1 PEM into API_CA_CERT for production."));
     }
+    apiClient = &tlsClient;
   } else {
-    webSocket.begin(WS_HOST, WS_PORT, WS_PATH);
+    apiClient = &plainClient;
   }
-  webSocket.onEvent(webSocketEvent);
-  webSocket.setReconnectInterval(WS_RECONNECT_INTERVAL_MS);
-  webSocket.enableHeartbeat(WS_PING_INTERVAL_MS, WS_PONG_TIMEOUT_MS, WS_DISCONNECT_COUNT);
-  Serial.print(F("[WS] Connecting to "));
-  Serial.print(USE_TLS ? F("wss://") : F("ws://"));
-  Serial.print(WS_HOST);
+  apiClient->setTimeout(HTTP_RESPONSE_TIMEOUT_MS);
+  Serial.print(F("[API] Telemetry endpoint: "));
+  Serial.print(USE_TLS ? F("https://") : F("http://"));
+  Serial.print(API_HOST);
   Serial.print(F(":"));
-  Serial.print(WS_PORT);
-  Serial.println(WS_PATH);
+  Serial.print(API_PORT);
+  Serial.println(API_PATH);
 
   // Initial read to calibrate
   float initialDistance = readDistanceCm();
@@ -282,8 +281,8 @@ void setup() {
     potentialState = STATE_VACANT;
     currentState = STATE_VACANT;
     // Startup safety check: if a session is dangling from a previous power-off,
-    // the post-authentication state sync (state "vacant") closes it on the server.
-    Serial.println(F("[INIT] Desk vacant on boot. Current state (vacant) will sync after WebSocket authentication."));
+    // the first "vacant" telemetry POST closes it on the server.
+    Serial.println(F("[INIT] Desk vacant on boot. Current state (vacant) is sent with the next telemetry POST."));
   }
   potentialStateStartTime = millis();
 
@@ -302,16 +301,12 @@ void loop() {
     connectToWiFi();
   }
 
-  // 2. Drive the WebSocket client (non-blocking; auto-reconnects every
-  //    WS_RECONNECT_INTERVAL_MS when the socket or Wi-Fi drops)
-  webSocket.loop();
-
-  // 3. Periodic Sensor Measurement (approx. every 700 ms)
+  // 2. Periodic Sensor Measurement (approx. every 700 ms)
   if (now - lastSensorReadTime >= SENSOR_INTERVAL) {
     lastSensorReadTime = now;
 
     float distance = readDistanceCm();
-    lastMeasuredDistanceCm = distance; // remembered for the periodic telemetry message
+    lastMeasuredDistanceCm = distance; // remembered for the periodic telemetry POST
 
     // Print reading to Serial Monitor
     Serial.print(F("[SENSOR] Dist: "));
@@ -354,30 +349,28 @@ void loop() {
       unsigned long requiredDuration = (potentialState == STATE_VACANT) ? VACANT_CONFIRM : OCCUPIED_CONFIRM;
 
       if (duration >= requiredDuration && potentialState != currentState) {
-        // State change is confirmed!
+        // State change is confirmed. Nothing to transmit here — the next
+        // telemetry POST (≤ 2.5s away) carries the new current state.
         Serial.println();
         Serial.print(F(">>> [STATE CHANGED] Confirmed transition to: "));
-        Serial.println(stateName(potentialState));
+        Serial.print(stateName(potentialState));
+        Serial.println(F(" (sent with next telemetry POST)"));
 
         currentState = potentialState;
-        sendStateChange(currentState);
       }
     }
 
     Serial.println();
   }
 
-  // 4. Periodic live distance telemetry (every SENSOR_SEND_INTERVAL_MS).
-  //    Tiny JSON frame on the already-open WebSocket; the backend pushes it
-  //    to dashboard tabs via SSE. Silently skipped while offline.
-  if (now - lastSensorSendTime >= SENSOR_SEND_INTERVAL_MS) {
-    lastSensorSendTime = now;
-    sendSensorReading();
+  // 3. Periodic telemetry POST (every TELEMETRY_INTERVAL_MS). Carries the
+  //    current state + latest distance; the backend treats it as the device
+  //    heartbeat. Silently skipped while offline — sensing continues, and the
+  //    next successful POST reconciles everything (it's a state snapshot).
+  if (now - lastTelemetryPostTime >= TELEMETRY_INTERVAL_MS) {
+    lastTelemetryPostTime = now;
+    postTelemetry();
   }
-
-  // NOTE: No HTTP heartbeat anymore — WebSocket ping/pong (library heartbeat +
-  // server pings) detects dead connections, and the backend closes/keeps the
-  // session based on the connection state itself.
 
   yield(); // Allow ESP8266 background tasks (WiFi, TCP) to run
 }
@@ -411,78 +404,10 @@ float readDistanceCm() {
 }
 
 // ==============================================================================
-// 8. WEBSOCKET DISPATCH (replaces the old HTTP start/stop/heartbeat calls)
+// 8. HTTP TELEMETRY (replaces the old WebSocket dispatch)
 // ==============================================================================
 
-void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED:
-      // Payload holds the connected URL/path
-      Serial.print(F("[WS] WebSocket connected ("));
-      Serial.write(payload, (int)length);
-      Serial.println(F(") — authenticating..."));
-      wsAuthenticated = false;
-      sendAuthenticate();
-      break;
-
-    case WStype_DISCONNECTED:
-      wsAuthenticated = false;
-      Serial.println(F("[WS] WebSocket disconnected"));
-      Serial.println(F("[WS] WebSocket reconnecting..."));
-      break;
-
-    case WStype_TEXT:
-      handleServerMessage((char*)payload, length);
-      break;
-
-    case WStype_ERROR:
-      Serial.println(F("[WS] WebSocket error"));
-      break;
-
-    default:
-      // WStype_PING / WStype_PONG are answered automatically by the library
-      break;
-  }
-}
-
-void handleServerMessage(char* msg, size_t length) {
-  if (strstr(msg, "\"type\":\"authenticated\"") != nullptr) {
-    wsAuthenticated = true;
-    Serial.println(F("[WS] WebSocket authenticated"));
-    syncCurrentState();
-    return;
-  }
-
-  if (strstr(msg, "\"type\":\"auth_error\"") != nullptr) {
-    wsAuthenticated = false;
-    Serial.println(F("[WS] Authentication rejected by server — check DEVICE_TOKEN"));
-    return;
-  }
-
-  if (strstr(msg, "\"type\":\"ack\"") != nullptr) {
-    Serial.print(F("[WS] Server ack: "));
-    Serial.write((uint8_t*)msg, (int)length);
-    Serial.println();
-    return;
-  }
-
-  if (strstr(msg, "\"type\":\"error\"") != nullptr) {
-    Serial.print(F("[WS] Server error message: "));
-    Serial.write((uint8_t*)msg, (int)length);
-    Serial.println();
-    return;
-  }
-}
-
-void sendAuthenticate() {
-  char payload[192];
-  snprintf(payload, sizeof(payload),
-           "{\"type\":\"authenticate\",\"deviceId\":\"%s\",\"token\":\"%s\"}",
-           DEVICE_ID, DEVICE_TOKEN);
-  webSocket.sendTXT(payload);
-}
-
-/** Wire/serial name for a state — matches the backend's state_change vocabulary */
+/** Wire/serial name for a state — matches the backend telemetry vocabulary */
 const char* stateName(State s) {
   switch (s) {
     case STATE_RELAXING:  return "relaxing";
@@ -492,58 +417,120 @@ const char* stateName(State s) {
 }
 
 /**
- * Send the given state to the backend. If the socket is not (yet)
- * authenticated, nothing is transmitted — the state is already reflected in
- * `currentState` and will be synced once right after the next successful
- * authentication. This replaces the old pending-retry queue: only the latest
- * state ever reaches the server, never a stale intermediate event.
+ * Ensure the persistent API connection is up (TLS handshake happens here on
+ * first use and after the server closes the keep-alive connection).
  */
-void sendStateChange(State newState) {
-  if (!webSocket.isConnected() || !wsAuthenticated) {
-    Serial.println(F("[WS] Offline — state held locally, will sync after reconnect"));
-    return;
-  }
+bool ensureApiClientConnected() {
+  if (apiClient->connected()) return true;
 
-  char payload[128];
-  snprintf(payload, sizeof(payload),
-           "{\"type\":\"state_change\",\"deviceId\":\"%s\",\"state\":\"%s\"}",
-           DEVICE_ID, stateName(newState));
-
-  if (webSocket.sendTXT(payload)) {
-    Serial.print(F("[WS] State sent: "));
-    Serial.println(stateName(newState));
-  } else {
-    Serial.println(F("[WS] Send failed — state held locally, will sync after reconnect"));
+  Serial.print(F("[API] Connecting to "));
+  Serial.print(API_HOST);
+  Serial.println(F(" ..."));
+  if (!apiClient->connect(API_HOST, API_PORT)) {
+    Serial.println(F("[API] Connect failed — offline, sensing continues"));
+    return false;
   }
+  Serial.println(F("[API] Connected"));
+  return true;
 }
 
 /**
- * Send the latest distance reading as lightweight telemetry. Skipped silently
- * while the WebSocket is down (the dashboard holds the last known value).
+ * POST one telemetry snapshot: {deviceId, distance, state, timestamp}.
+ * Every POST IS the device heartbeat. Returns true on HTTP 2xx. Any failure
+ * just drops the connection (fresh handshake next cycle) — sensing never
+ * stops, and because each POST is a full state snapshot, nothing needs to be
+ * queued or replayed after an outage.
  */
-void sendSensorReading() {
-  if (!webSocket.isConnected() || !wsAuthenticated) return;
+bool postTelemetry() {
+  if (WiFi.status() != WL_CONNECTED) return false;
+  if (!ensureApiClientConnected()) return false;
 
-  char payload[96];
-  snprintf(payload, sizeof(payload),
-           "{\"type\":\"sensor\",\"deviceId\":\"%s\",\"distance\":%.1f}",
-           DEVICE_ID, lastMeasuredDistanceCm);
-  webSocket.sendTXT(payload);
-}
+  // Discard any stale response bytes left from a previous exchange so the
+  // status line read below always belongs to THIS request.
+  while (apiClient->available()) apiClient->read();
 
-/**
- * Called right after every successful authentication: syncs the CURRENT
- * confirmed state (not old queued events). Server-side handling is idempotent:
- * - "relaxing"/"attentive" with an active session → posture updated (no-op if same)
- * - "relaxing"/"attentive" without a session      → session opened now
- * - "vacant" without a session                    → no-op (also closes dangling
- *   sessions after a power-off while the server was not connected... handled by
- *   disconnect logic on the server)
- */
-void syncCurrentState() {
-  Serial.print(F("[WS] Syncing current state: "));
-  Serial.println(stateName(currentState));
-  sendStateChange(currentState);
+  char body[160];
+  snprintf(body, sizeof(body),
+           "{\"deviceId\":\"%s\",\"distance\":%.1f,\"state\":\"%s\",\"timestamp\":%lu}",
+           DEVICE_ID, lastMeasuredDistanceCm, stateName(currentState),
+           (unsigned long)time(nullptr));
+
+  char request[512];
+  int requestLen = snprintf(request, sizeof(request),
+           "POST %s HTTP/1.1\r\n"
+           "Host: %s\r\n"
+           "Authorization: Bearer %s\r\n"
+           "Content-Type: application/json\r\n"
+           "Content-Length: %d\r\n"
+           "Connection: keep-alive\r\n"
+           "\r\n"
+           "%s",
+           API_PATH, API_HOST, DEVICE_TOKEN, (int)strlen(body), body);
+
+  if (requestLen < 0 || (size_t)requestLen >= sizeof(request)) {
+    Serial.println(F("[API] Request build failed"));
+    apiClient->stop();
+    return false;
+  }
+
+  size_t sent = apiClient->write((const uint8_t*)request, requestLen);
+  if (sent != (size_t)requestLen) {
+    Serial.println(F("[API] Send failed — state held locally, retried with next POST"));
+    apiClient->stop();
+    return false;
+  }
+
+  // Wait for the response status line
+  unsigned long start = millis();
+  while (!apiClient->available()) {
+    if (!apiClient->connected()) {
+      Serial.println(F("[API] Connection closed before response"));
+      apiClient->stop();
+      return false;
+    }
+    if (millis() - start > HTTP_RESPONSE_TIMEOUT_MS) {
+      Serial.println(F("[API] Response timeout"));
+      apiClient->stop();
+      return false;
+    }
+    delay(10);
+  }
+
+  // "HTTP/1.1 200 OK" → code starts at char 9
+  String statusLine = apiClient->readStringUntil('\n');
+  int httpCode = 0;
+  if (statusLine.startsWith("HTTP/1.")) {
+    httpCode = statusLine.substring(9, 12).toInt();
+  }
+
+  // Best-effort drain of headers + tiny JSON body (they may still be in
+  // flight); anything left over is discarded before the next POST anyway.
+  unsigned long quietStart = millis();
+  while (millis() - quietStart < 300) {
+    while (apiClient->available()) {
+      apiClient->read();
+      quietStart = millis();
+    }
+    if (!apiClient->connected()) break;
+    delay(5);
+  }
+
+  if (httpCode >= 200 && httpCode < 300) {
+    Serial.print(F("[API] Telemetry POST: "));
+    Serial.print(stateName(currentState));
+    Serial.print(F(" @ "));
+    Serial.print(lastMeasuredDistanceCm, 1);
+    Serial.print(F(" cm → HTTP "));
+    Serial.println(httpCode);
+    return true;
+  }
+
+  Serial.print(F("[API] Telemetry POST failed → HTTP "));
+  Serial.println(httpCode);
+  if (httpCode == 401 || httpCode == 403) {
+    Serial.println(F("[API] Authentication rejected — check DEVICE_TOKEN"));
+  }
+  return false;
 }
 
 // ==============================================================================

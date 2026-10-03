@@ -31,6 +31,10 @@ export default function DashboardPage() {
   const [bannerDismissed, setBannerDismissed] = useState<boolean>(false);
   const previousStatusRef = useRef<string | null>(null);
   const previousDurationRef = useRef<number>(0);
+  // Coalesces overlapping background refreshes (2.5s poll + SSE-triggered
+  // refetch) so two in-flight GET /status responses can't land out of order.
+  // Manual refreshes always run.
+  const fetchInFlightRef = useRef<boolean>(false);
 
   // Break Reminder settings (in minutes: 30, 45, 60 or 0 to disable)
   const [breakIntervalMin, setBreakIntervalMin] = useState<number>(45);
@@ -95,6 +99,10 @@ export default function DashboardPage() {
 
   // Fetch status and metrics from server
   const fetchStatus = useCallback(async (isBackground = false) => {
+    // Background refreshes (2.5s poll + SSE events) coalesce while one is in
+    // flight; manual refreshes always run so the loading state always clears.
+    if (isBackground && fetchInFlightRef.current) return;
+    fetchInFlightRef.current = true;
     try {
       const { url, headers } = getStatusEndpoint();
       const res = await fetch(url, {
@@ -164,6 +172,7 @@ export default function DashboardPage() {
         err instanceof Error ? err.message : 'Could not reach Sitting Tracker API'
       );
     } finally {
+      fetchInFlightRef.current = false;
       if (!isBackground) {
         setIsLoading(false);
       }
@@ -225,9 +234,10 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // ── Real-Time Live Push Stream (Server-Sent Events) ───────────────────────
-  // Instantly refreshes the dashboard the EXACT millisecond the NodeMCU calls
-  // POST /api/sitting/start or POST /api/sitting/stop.
+  // ── Real-Time Session Events (Server-Sent Events) ─────────────────────────
+  // Instantly refreshes the dashboard the EXACT millisecond the device's
+  // telemetry POST (or a manual control) transitions the session. Live
+  // distance arrives via the 2.5s HTTP poll below, not via SSE.
   useEffect(() => {
     let es: EventSource | null = null;
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
@@ -241,11 +251,6 @@ export default function DashboardPage() {
         es.onmessage = (event) => {
           try {
             const payload = JSON.parse(event.data);
-            if (payload.type === 'DISTANCE') {
-              // Lightweight telemetry push — no status refetch needed
-              setDistanceCm(typeof payload.distanceCm === 'number' ? payload.distanceCm : null);
-              return;
-            }
             if (payload.type === 'POSTURE_CHANGE') {
               // Posture shifted (relaxing ↔ attentive) — refresh metrics and
               // timers instantly, without session start/stop chimes
@@ -253,7 +258,7 @@ export default function DashboardPage() {
               return;
             }
             if (payload.type === 'STATUS_CHANGE') {
-              console.log('[Real-Time Telemetry] Instant event received from NodeMCU:', payload.action);
+              console.log('[Real-Time Telemetry] Instant event received from device:', payload.action);
               // Trigger instant data refresh, audio chime, and notification (< 20ms)
               fetchStatus(true);
             }
@@ -280,18 +285,19 @@ export default function DashboardPage() {
     };
   }, [fetchStatus]);
 
-  // Background polling: runs every 30 seconds via dedicated Web Worker as a
-  // safety net. Real-time updates arrive instantly over SSE (device events AND
-  // live distance); this slow poll only reconciles the UI if SSE silently died
-  // and triggers the server's stale-session auto-close check. Dedicated Web
-  // Workers bypass Chrome's background tab timer throttling completely.
+  // Live polling: every 2.5 seconds via dedicated Web Worker — the primary
+  // data channel (session, posture, stats AND the latest distance reported by
+  // the device's telemetry POSTs). SSE above adds instant push for session
+  // events; this poll reconciles anything missed and triggers the server's
+  // stale-session auto-close check. Dedicated Web Workers bypass Chrome's
+  // background tab timer throttling completely.
   useEffect(() => {
     if (!isPolling) {
       backgroundTimer.stop('poll');
       return;
     }
 
-    backgroundTimer.start('poll', 30000, () => {
+    backgroundTimer.start('poll', 2500, () => {
       fetchStatus(true);
     });
 
@@ -611,7 +617,7 @@ export default function DashboardPage() {
                 onClick={() => handleSimulate('start')}
                 disabled={simulating || isOccupied}
                 className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium bg-panel text-ink4 border border-edge hover:bg-chip hover:text-ink2 disabled:opacity-30 disabled:cursor-not-allowed transition-colors active:scale-[0.96]"
-                title="Simulate NodeMCU sending POST /api/sitting/start"
+                title="Simulate a device telemetry POST with state attentive"
               >
                 <Play className="w-3 h-3" />
                 <span>Sit Down</span>
@@ -621,7 +627,7 @@ export default function DashboardPage() {
                 onClick={() => handleSimulate('stop')}
                 disabled={simulating || !isOccupied}
                 className="inline-flex items-center gap-1 px-2 py-1 rounded-lg text-[11px] font-medium bg-panel text-ink4 border border-edge hover:bg-chip hover:text-ink2 disabled:opacity-30 disabled:cursor-not-allowed transition-colors active:scale-[0.96]"
-                title="Simulate NodeMCU sending POST /api/sitting/stop"
+                title="Simulate a device telemetry POST with state vacant"
               >
                 <Square className="w-3 h-3" />
                 <span>Stand Up</span>

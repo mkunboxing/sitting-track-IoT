@@ -8,8 +8,16 @@ import {
   setPosture,
   accumulatePosture,
   currentPostureStretchSeconds,
+  touchActiveSessionHeartbeat,
 } from '../lib/sessionService';
-import { getLatestSensorReading } from '../ws/deviceGateway';
+import {
+  DEVICE_ONLINE_WINDOW_MS,
+  getLatestSensorReading,
+  getLastKnownState,
+  recordTelemetry,
+  setLastKnownState,
+  shouldTouchHeartbeat,
+} from '../lib/telemetryStore';
 import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '../lib/timeUtils';
 import type { DashboardStatsResponse, DayStats, SittingSession } from '../types/sitting';
 
@@ -133,8 +141,9 @@ sittingRouter.get('/status', async (req, res) => {
 
       const timeSinceCheck = now.getTime() - lastCheckTime;
       // If module has been silent for > 30 seconds (and heartbeat was established) or > 8 hours (stale safety).
-      // The WS gateway touches last_heartbeat_at every 10s while connected, so a
-      // live device never trips this; it only fires for a genuinely gone device.
+      // The device's HTTP telemetry (POST /heartbeat, every 2.5s) touches
+      // last_heartbeat_at every 10s, so a live device never trips this; it
+      // only fires for a genuinely gone device.
       const isStaleHeartbeat = activeSession.last_heartbeat_at && timeSinceCheck > 30 * 1000;
       const isUnreasonablyOld = timeSinceCheck > 8 * 3600 * 1000;
 
@@ -265,7 +274,7 @@ sittingRouter.get('/status', async (req, res) => {
       };
     });
 
-    const latestSensor = getLatestSensorReading();
+    const latestSensor = getLatestSensorReading(DEVICE_ONLINE_WINDOW_MS);
 
     const responsePayload: DashboardStatsResponse = {
       status: activeSession
@@ -300,8 +309,9 @@ sittingRouter.get('/status', async (req, res) => {
 // ─────────────────────────────────────────────────────────────
 // GET /stream — Server-Sent Events (SSE)
 // Web clients connect via `new EventSource('<api>/api/sitting/stream')`.
-// When the NodeMCU calls POST /api/sitting/start or POST /api/sitting/stop,
-// an event is pushed through this stream immediately to all clients.
+// When the device telemetry POST transitions the seating state (or the
+// dashboard calls POST /api/sitting/simulate), an event is pushed through
+// this stream immediately to all clients.
 // ─────────────────────────────────────────────────────────────
 sittingRouter.get('/stream', (req, res) => {
   eventBroadcaster.addClient(req, res);
@@ -403,141 +413,119 @@ sittingRouter.post('/simulate', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// POST /start — device (NodeMCU) opens a sitting session
-// ─────────────────────────────────────────────────────────────
-sittingRouter.post('/start', requireDeviceToken, async (req, res) => {
-  // 1. Check Supabase configuration
-  if (!isSupabaseConfigured()) {
-    return res.status(503).json({
-      success: false,
-      error: 'Database not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.',
-    });
-  }
-
-  // 2. Session lifecycle is handled by the shared service (also used by the
-  //    WebSocket gateway) — identical duplicate/race handling as before.
-  const result = await openSession();
-
-  switch (result.status) {
-    case 'db_error':
-      console.error('[API /sitting/start] Query/insert error:', result.error);
-      return res.status(500).json({ success: false, error: result.error });
-
-    case 'already_active': {
-      const message =
-        result.reason === 'race'
-          ? 'An active session was concurrently created.'
-          : 'An active session is already in progress.';
-      console.log(`[API /sitting/start] ${message} Returning existing session.`);
-      return res.status(200).json({
-        success: true,
-        status: 'already_active',
-        message,
-        session: result.session,
-      });
-    }
-
-    case 'started':
-      console.log(`[API /sitting/start] Started session ${result.session.id} at ${result.session.started_at}`);
-      return res.status(201).json({
-        success: true,
-        status: 'started',
-        message: 'Sitting session started successfully.',
-        session: result.session,
-      });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-// POST /stop — device (NodeMCU) closes the active sitting session
-// ─────────────────────────────────────────────────────────────
-sittingRouter.post('/stop', requireDeviceToken, async (req, res) => {
-  // 1. Check Supabase configuration
-  if (!isSupabaseConfigured()) {
-    return res.status(503).json({
-      success: false,
-      error: 'Database not configured. Please set SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY.',
-    });
-  }
-
-  // 2. Session lifecycle is handled by the shared service (also used by the
-  //    WebSocket gateway) — identical idempotent behavior as before.
-  const result = await closeActiveSession();
-
-  switch (result.status) {
-    case 'db_error':
-      console.error('[API /sitting/stop] Query/update error:', result.error);
-      return res.status(500).json({ success: false, error: result.error });
-
-    case 'no_active_session':
-      console.log('[API /sitting/stop] No active session found. Ignoring duplicate stop.');
-      return res.status(200).json({
-        success: true,
-        status: 'no_active_session',
-        message: 'No active session was in progress. Nothing to stop.',
-      });
-
-    case 'stopped':
-      console.log(
-        `[API /sitting/stop] Stopped session ${result.session.id}. Duration: ${result.durationSeconds} seconds.`
-      );
-      return res.status(200).json({
-        success: true,
-        status: 'stopped',
-        message: 'Sitting session stopped successfully.',
-        session: result.session,
-      });
-  }
-});
-
-// ─────────────────────────────────────────────────────────────
-// POST /heartbeat — device keeps the active session alive
+// POST /heartbeat — device telemetry (replaces the old WebSocket gateway and
+// the legacy HTTP /start + /stop routes).
+//
+// The ESP8266 POSTs a seating-state snapshot every 2.5s:
+//   Authorization: Bearer <DEVICE_TOKEN>
+//   { "deviceId": "sitting-tracker-01", "distance": 10.5,
+//     "state": "attentive", "timestamp": 1234567890 }
+//
+// Each request IS the device's last-contact/heartbeat signal:
+// 1. The reading is cached in memory (never persisted) for GET /status.
+// 2. The state snapshot is edge-detected against the device's last known
+//    state; only actual transitions call the shared sessionService, so
+//    manual dashboard controls are never overridden by unchanged snapshots
+//    and identical snapshots don't hit the DB every 2.5s.
+//    - relaxing/attentive → setPosture (opens a session when vacant)
+//    - vacant             → closeActiveSession
+// 3. last_heartbeat_at is touched (throttled to one write per 10s, the same
+//    rate as the old WS ping loop) so the /status stale-check auto-closes the
+//    session — with ended_at = last contact — if snapshots stop arriving.
+//
+// All fields are optional (a bare heartbeat-only POST is still valid) and
+// `timestamp` is accepted but ignored: the server clock stays the source of
+// truth for all session timing.
 // ─────────────────────────────────────────────────────────────
 sittingRouter.post('/heartbeat', requireDeviceToken, async (req, res) => {
   if (!isSupabaseConfigured()) {
     return res.status(503).json({ success: false, error: 'Database not configured.' });
   }
 
-  const supabase = getSupabaseServerClient();
+  const body = (req.body ?? {}) as Record<string, unknown>;
+
+  // deviceId is advisory (key for the in-memory maps / /health display); the
+  // Bearer token is the actual authentication. Trim + cap like the old WS auth.
+  const deviceId =
+    typeof body.deviceId === 'string' && body.deviceId.trim().length > 0
+      ? body.deviceId.trim().slice(0, 64)
+      : 'default';
+
+  const state = body.state;
+  if (state !== undefined && state !== 'relaxing' && state !== 'attentive' && state !== 'vacant') {
+    return res.status(400).json({
+      success: false,
+      error: 'state must be "relaxing", "attentive" or "vacant" when present',
+    });
+  }
+
+  let distance: number | undefined;
+  if (body.distance !== undefined) {
+    distance = Number(body.distance);
+    if (!Number.isFinite(distance)) {
+      return res.status(400).json({ success: false, error: 'distance must be a number when present' });
+    }
+  }
+
+  if (body.timestamp !== undefined && !Number.isFinite(Number(body.timestamp))) {
+    return res.status(400).json({ success: false, error: 'timestamp must be a number when present' });
+  }
 
   try {
-    // 1. Find currently active session
-    const { data: activeSession, error: fetchError } = await supabase
-      .from('sitting_sessions')
-      .select('id, started_at')
-      .is('ended_at', null)
-      .order('started_at', { ascending: false })
-      .limit(1)
-      .maybeSingle();
+    // 1. Cache the reading for /status (in-memory only, never stored in the DB)
+    recordTelemetry(deviceId, distance);
 
-    if (fetchError) {
-      return res.status(500).json({ success: false, error: fetchError.message });
+    // 2. Edge-detect the state snapshot → session lifecycle via the shared service
+    if (state !== undefined && getLastKnownState(deviceId) !== state) {
+      setLastKnownState(deviceId, state);
+
+      if (state === 'vacant') {
+        const result = await closeActiveSession();
+        switch (result.status) {
+          case 'stopped':
+            console.log(
+              `[API /sitting/heartbeat] ${deviceId}: vacant — session closed, duration ${result.durationSeconds}s`
+            );
+            break;
+          case 'no_active_session':
+            // Duplicate vacant / session already closed by the stale-check — safe no-op
+            console.log(`[API /sitting/heartbeat] ${deviceId}: vacant — no active session, nothing to close`);
+            break;
+          case 'db_error':
+            console.error(`[API /sitting/heartbeat] ${deviceId}: failed to close session:`, result.error);
+            return res.status(500).json({ success: false, error: result.error });
+        }
+      } else {
+        const result = await setPosture(state);
+        switch (result.status) {
+          case 'updated':
+            console.log(
+              `[API /sitting/heartbeat] ${deviceId}: ${state} — session ${result.session.id} posture set to ${state}`
+            );
+            break;
+          case 'unchanged':
+            // Session already in this posture — safe no-op
+            console.log(`[API /sitting/heartbeat] ${deviceId}: ${state} — no posture change needed`);
+            break;
+          case 'db_error':
+            console.error(`[API /sitting/heartbeat] ${deviceId}: failed to set posture:`, result.error);
+            return res.status(500).json({ success: false, error: result.error });
+        }
+      }
     }
 
-    if (!activeSession) {
-      return res.json({
-        success: true,
-        active: false,
-        message: 'No active session found.',
-      });
+    // 3. Fresh contact → touch last_heartbeat_at (throttled; no-op when no session is active)
+    if (shouldTouchHeartbeat(deviceId)) {
+      await touchActiveSessionHeartbeat();
     }
-
-    // 2. Update heartbeat timestamp
-    const nowIso = new Date().toISOString();
-    await supabase
-      .from('sitting_sessions')
-      .update({
-        last_heartbeat_at: nowIso,
-      })
-      .eq('id', activeSession.id);
 
     return res.json({
       success: true,
-      active: true,
-      sessionId: activeSession.id,
-      timestamp: nowIso,
+      deviceId,
+      timestamp: new Date().toISOString(),
     });
   } catch (err: unknown) {
+    console.error('[API /sitting/heartbeat] Internal error:', err);
     return res.status(500).json({
       success: false,
       error: 'Internal error: ' + String(err),

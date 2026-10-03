@@ -7,7 +7,7 @@ The project is split into two apps:
 | App | Location | Role |
 | :--- | :--- | :--- |
 | **Frontend** | [`frontend/`](./frontend) | Next.js dashboard (static UI, calls the API server) |
-| **Backend** | [`backend/`](./backend) | Express (TypeScript) API + device WebSocket + SSE streaming + Supabase access |
+| **Backend** | [`backend/`](./backend) | Express (TypeScript) API + device HTTP telemetry endpoint + SSE streaming + Supabase access |
 
 ---
 
@@ -16,25 +16,23 @@ The project is split into two apps:
 ```
 ┌─────────────────────────────────┐
 │     NodeMCU ESP8266 + HC-SR04   │
-│  - Distance <= 100cm (Sitting)  │
-│  - Distance >  100cm (Away)     │
-│  - 2s Debounce for Sitting      │
-│  - 5s Debounce for Away         │
+│  - Distance <  8cm   (Relaxing) │
+│  - 8.5–45cm          (Attentive)│
+│  - Distance >  45cm  (Vacant)   │
+│  - 2s / 5s Debounce + Deadband  │
 │  - Loop Delay: ~700ms           │
 └───────────────┬─────────────────┘
                 │
-                │ Persistent WebSocket (JSON)
-                │ ws(s)://…/ws/device + DEVICE_TOKEN auth
+                │ HTTP telemetry POST every 2.5s
+                │ POST /api/sitting/heartbeat + Bearer DEVICE_TOKEN
+                │ { distance, state, timestamp }
                 ▼
 ┌─────────────────────────────────┐
 │         Express API Server      │
 │         (backend/, TypeScript)  │
-│  - WS   /ws/device              │
-│  - POST /api/sitting/start      │
-│  - POST /api/sitting/stop       │
-│  - POST /api/sitting/heartbeat  │
+│  - POST /api/sitting/heartbeat  │  ← device telemetry = heartbeat
 │  - GET  /api/sitting/status     │
-│  - GET  /api/sitting/stream     │
+│  - GET  /api/sitting/stream     │  ← SSE (session/posture events)
 │  - POST /api/sitting/simulate   │
 └───────────────┬─────────────────┘
                 │
@@ -48,7 +46,7 @@ The project is split into two apps:
 │  - Server-calculated duration   │
 └───────────────┬─────────────────┘
                 │
-                │ Real-time / Polling Telemetry
+                │ HTTP poll every 2.5s (+ SSE push)
                 ▼
 ┌─────────────────────────────────┐
 │       Next.js Dashboard         │
@@ -61,36 +59,42 @@ The project is split into two apps:
 
 ---
 
-## 🔗 Device ⇄ Backend WebSocket
+## 🔗 Device ⇄ Backend HTTP Telemetry
 
-The ESP8266 talks to the backend over a **persistent WebSocket** (library: `WebSockets` by Markus Sattler, install via Arduino Library Manager). Connection state replaces the old HTTP heartbeat.
+The ESP8266 talks to the backend over **plain HTTP requests** — no persistent connection, no extra Arduino library (built-in `WiFiClientSecure`). Every **2.5 s** the device POSTs its **current** seating state and distance:
 
-**Exact URL:** `ws://<backend-host>:4000/ws/device` (dev) · `wss://<backend-host>/ws/device` (production)
+**Exact URL:** `http://<backend-host>:4000/api/sitting/heartbeat` (dev) · `https://<backend-host>/api/sitting/heartbeat` (production)
 
-### Protocol (JSON text frames)
+```json
+POST /api/sitting/heartbeat
+Authorization: Bearer <DEVICE_TOKEN>
+Content-Type: application/json
 
-| Direction | Message | Purpose |
-| :--- | :--- | :--- |
-| ESP → Backend | `{"type":"authenticate","deviceId":"sitting-tracker-01","token":"…"}` | Must be the first message within 10s of connecting, or the socket is closed (4001) |
-| Backend → ESP | `{"type":"authenticated","deviceId":"…"}` | Auth OK; the ESP then syncs its **current** state |
-| Backend → ESP | `{"type":"auth_error","error":"…"}` + close 4001 | Bad token / timeout |
-| ESP → Backend | `{"type":"state_change","deviceId":"…","state":"sitting"\|"away"}` | Opens/closes a session (idempotent — duplicates are safe no-ops) |
-| Backend → ESP | `{"type":"ack","state":"…","result":"started\|closed\|already_active\|no_active_session","durationSeconds"?:n}` | Session result |
-| ESP → Backend | `{"type":"sensor","deviceId":"…","distance":75.4}` | Live distance telemetry, sent every 5 s; cached in memory and pushed to dashboards via SSE (never stored in the DB). `-1` = out of range |
+{ "deviceId": "sitting-tracker-01", "distance": 10.5, "state": "attentive", "timestamp": 1234567890 }
+```
+
+- `state` is one of `relaxing` | `attentive` | `vacant` (classified on the device: < 8 cm relaxing · 8.5–45 cm attentive · > 45 cm or invalid vacant, with an 8–8.5 cm deadband and 2 s / 5 s debounce).
+- `distance` is the latest HC-SR04 reading; `-1` = out of range.
+- `timestamp` (epoch seconds from NTP) is informational only — the **server clock** remains the source of truth for all session timing.
+- `distance`/`state`/`timestamp`/`deviceId` are all optional: a bare POST still works as a heartbeat-only touch.
+
+### How the backend processes each snapshot
+
+1. **Telemetry cache (in-memory, never persisted):** the reading is stored and surfaced by `GET /status` as `distanceCm` + `distanceUpdatedAt`. Readings older than 30 s are reported as no-reading, so a powered-off device shows "waiting for sensor…" instead of a frozen distance.
+2. **Edge-detected session transitions:** the backend compares the snapshot's state with the device's last known state and calls the shared `sessionService` **only on actual changes** — `relaxing`/`attentive` → `setPosture` (opens a session when vacant), `vacant` → `closeActiveSession`. Unchanged snapshots are no-ops (no DB hit every 2.5 s), and manual dashboard controls are never overridden by the device's unchanged state.
+3. **Heartbeat:** each fresh contact touches `last_heartbeat_at` (throttled to one write per 10 s — the same rate the old WebSocket ping loop used), so the `/status` stale-check keeps working unchanged.
 
 ### Liveness, disconnects & reconnects
 
-- **Keepalive:** the ESP pings every 15s (`enableHeartbeat`) and the backend pings every 30s; dead sockets are terminated. While a device is connected, the backend touches `last_heartbeat_at`, so the `/status` stale-check keeps working unchanged.
-- **Unexpected disconnect** (Wi-Fi loss, power-off, platform-forced drop): the session is **not** closed instantly — managed platforms like Cloud Run force-close long-lived WebSocket connections periodically, and closing on every drop would fragment sessions. Instead the session is left active and auto-closed by the `/status` stale-check (~30 s, `ended_at` = last-contact time) **only if the device does not return**. A device that reconnects quickly and syncs `sitting` continues the same session (`already_active`) with no fragmentation.
-- **Reconnect:** the ESP reconnects every 5s (no rapid loops), re-authenticates, then sends only its **current** state. Backend handling is idempotent, so normal reconnects never create duplicate sessions: `sitting` with an active session → no-op; `away` without one → no-op.
-- **State change while offline:** nothing is queued or replayed — the ESP holds its current state locally and sends it once after the next successful authentication (never a stale event).
-- **Live distance:** the device sends its latest HC-SR04 reading every 5 s; the backend pushes it to all dashboard tabs as a `{"type":"DISTANCE",…}` SSE event (no status refetch needed) and includes it in `/status` responses as `distanceCm`. In-memory only — nothing is persisted.
-- **One connection per deviceId:** a newer authenticated connection silently replaces the older one (close code 4000) without touching sessions.
-- Backend close codes: `4001` authentication failed/timeout/not authenticated · `4000` connection replaced.
+- **Heartbeat = the telemetry POST itself.** No ping/pong exists anywhere anymore: a device that stops posting (power-off, Wi-Fi loss) goes stale, and the `/status` stale-check auto-closes any active session (~30 s) with `ended_at` = last-contact time.
+- **Backend unavailable:** sensing never stops. The device skips the POST, keeps classifying locally, and retries on the next 2.5 s cycle. Because every POST is a full *current-state snapshot* (not an event), the first successful POST after an outage reconciles everything — nothing is queued or replayed.
+- **Device restart while sitting:** the first snapshot re-syncs the current state; idempotent handling (`already_active`) means no duplicate session.
+- **Auth:** every POST carries `Authorization: Bearer <DEVICE_TOKEN>` (same shared device token as before — invalid tokens get `401/403`, malformed bodies `400`).
+- **Live distance on the dashboard:** arrives via the dashboard's 2.5 s `GET /status` poll. SSE is still used for instant *session* events (`STATUS_CHANGE` / `POSTURE_CHANGE`) so chimes and notifications fire immediately.
 
 ### Backend implementation
 
-`backend/src/ws/deviceGateway.ts` — attached to the same HTTP server as Express (same port). Malformed JSON, oversized frames (4 KB cap), binary frames, and unknown message types are answered with `{"type":"error",…}` and can never crash the server. Session open/close logic is shared with the HTTP routes via `backend/src/lib/sessionService.ts`, so WebSocket and HTTP behave identically.
+`backend/src/lib/telemetryStore.ts` holds the in-memory telemetry state (latest reading per device, last known state per device, heartbeat-write throttle, online-device list for `/health`). `POST /heartbeat` in `backend/src/routes/sitting.ts` orchestrates: cache → edge-detect → `sessionService` → throttled heartbeat touch. Session open/close logic lives only in `backend/src/lib/sessionService.ts`, so telemetry, the dashboard's manual controls, and the stale-check all behave identically.
 
 ---
 
@@ -198,34 +202,25 @@ Open [http://localhost:3000](http://localhost:3000) in your browser. The dashboa
 ### Deploying
 
 - **Frontend (`frontend/`)** — deploys to Vercel. In the Vercel project settings, set **Root Directory = `frontend`** (Vercel auto-detects Next.js from there), and set the `NEXT_PUBLIC_API_URL` environment variable to the public URL of your Express server (it is inlined into the client bundle at build time), e.g. your Cloud Run URL.
-- **Backend (`backend/`)** — needs an **always-on host with WebSocket support** (Railway, Render, Fly.io, or a VPS all work; serverless platforms like Vercel Functions do **not** — they will not keep WebSocket or SSE connections open). Build with `npm run build`, start with `npm start`, and set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEVICE_TOKEN`, `PORT`, and `CORS_ORIGIN` there — `CORS_ORIGIN=*` allows any origin (easy for dev), or list explicit origins comma-separated, e.g. `http://localhost:3000,https://smart-tracking.vercel.app` (recommended for production). The device WebSocket and the HTTP API share one port — no extra port to open. If you put Nginx in front, forward the upgrade headers:
-  ```nginx
-  location / {
-      proxy_pass http://127.0.0.1:4000;
-      proxy_http_version 1.1;
-      proxy_set_header Upgrade $http_upgrade;
-      proxy_set_header Connection "upgrade";
-      proxy_read_timeout 300s;   # keep idle WS connections alive
-  }
-  ```
+- **Backend (`backend/`)** — needs an **always-on host with HTTP streaming support for SSE** (Railway, Render, Fly.io, or a VPS all work; serverless platforms like Vercel Functions do **not** — they will not keep SSE connections open). The device protocol is plain request/response HTTP POSTs, so no WebSocket support is required. Build with `npm run build`, start with `npm start`, and set `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `DEVICE_TOKEN`, `PORT`, and `CORS_ORIGIN` there — `CORS_ORIGIN=*` allows any origin (easy for dev), or list explicit origins comma-separated, e.g. `http://localhost:3000,https://smart-tracking.vercel.app` (recommended for production).
 
 #### Deploying the backend to Google Cloud Run
 
-Cloud Run works (it supports WebSockets and SSE), but two service settings matter for this app:
+Cloud Run works well for this app — the device flow is now ordinary request-based HTTP, which is exactly what Cloud Run bills and scales for. Only SSE needs long-lived connections:
 
 ```bash
 gcloud run deploy sitting-track-iot \
   --source backend \
   --region asia-south2 \
-  --timeout 3600 \
   --no-cpu-throttling \
   --set-env-vars "SUPABASE_URL=…,SUPABASE_SERVICE_ROLE_KEY=…,DEVICE_TOKEN=…,CORS_ORIGIN=https://your-frontend.vercel.app"
 ```
 
-- **`--timeout 3600`** — Cloud Run applies the request timeout to **WebSocket connections**: with the default 300 s, the device's connection is force-closed every 5 minutes. Raise it to the 1-hour max; the ESP reconnects within ~5 s of any forced drop and (thanks to grace-based disconnect handling) its session continues unbroken.
-- **`--no-cpu-throttling`** — "CPU always allocated", so the server-side ping/heartbeat-touch timers run reliably even between HTTP requests.
-- The app honors Cloud Run's injected `PORT` automatically (HTTP and WebSocket share it).
-- ESP firmware for Cloud Run: `WS_HOST = "<service>.run.app"`, `WS_PORT = 443`, `USE_TLS = true` (paste the **GTS Root R1** PEM from [pki.goog](https://pki.goog) into `WS_CA_CERT` for full certificate validation).
+- **`--no-cpu-throttling`** — "CPU always allocated", so the SSE keepalive timer runs reliably even between HTTP requests.
+- The old `--timeout 3600` WebSocket workaround is **no longer needed** — device requests are short-lived POSTs that finish in milliseconds. (Cloud Run's default 300 s request timeout applies only to the dashboard's SSE connections, which the browser transparently reconnects.)
+- The app honors Cloud Run's injected `PORT` automatically.
+- Scale-to-zero caveat: after an idle cold start, the first telemetry POST may be dropped while the instance boots; the ESP simply retries on its next 2.5 s cycle, and any session gap is handled by the stale-check.
+- ESP firmware for Cloud Run: `API_HOST = "<service>.run.app"`, `API_PORT = 443`, `USE_TLS = true` (the **GTS Root R1** PEM is already embedded in the sketch for full certificate validation).
 
 ---
 
@@ -240,11 +235,11 @@ The firmware source code is located in [`firmware/sitting_tracker/sitting_tracke
    http://arduino.esp8266.com/stable/package_esp8266com_index.json
    ```
 3. In **Tools > Board > Boards Manager**, search for `esp8266` and install the package.
-4. In **Library Manager**, install **"WebSockets" by Markus Sattler** (version 2.x) — required for the WebSocket transport.
+4. No extra libraries are needed — the firmware uses the built-in `WiFiClientSecure` (the old "WebSockets" library dependency was removed with the WebSocket transport).
 5. Select **NodeMCU 1.0 (ESP-12E Module)** in **Tools > Board**.
 6. Set CPU Frequency: **80 MHz** or **160 MHz**, Upload Speed: **115200**.
 
-### Configuring the WebSocket Server in the Firmware
+### Configuring the Backend API in the Firmware
 
 Open [`firmware/sitting_tracker/sitting_tracker.ino`](./firmware/sitting_tracker/sitting_tracker.ino) and edit the configuration block:
 
@@ -254,13 +249,13 @@ const WifiCredential WIFI_NETWORKS[] = {
   { "Mywifi",  "12343211" },
 };
 
-// 2. Point at the Express backend's WebSocket endpoint (NOT the dashboard URL):
-//    Local dev (your computer's LAN IP):  ws://192.168.1.120:4000/ws/device
-//    Production:                          wss://your-express-host/ws/device
-const char*    WS_HOST = "192.168.1.120";
-const uint16_t WS_PORT = 4000;
-const char*    WS_PATH = "/ws/device";
-const bool     USE_TLS = false;   // true → wss:// (paste Let's Encrypt ISRG Root X1 into WS_CA_CERT)
+// 2. Point at the Express backend's API (NOT the dashboard URL):
+//    Local dev (your computer's LAN IP):  http://192.168.1.120:4000/api/sitting/heartbeat
+//    Production:                          https://your-express-host/api/sitting/heartbeat
+const char*    API_HOST = "192.168.1.120";
+const uint16_t API_PORT = 4000;
+const char*    API_PATH = "/api/sitting/heartbeat";
+const bool     USE_TLS  = false;   // true → https:// (GTS Root R1 CA is already embedded)
 
 // 3. Device identity + token (must match DEVICE_TOKEN in backend/.env)
 const char* DEVICE_ID    = "sitting-tracker-01";
@@ -268,7 +263,7 @@ const char* DEVICE_TOKEN = "your-device-token";
 ```
 
 > [!NOTE]
-> The firmware talks to the **Express backend's WebSocket**, not the Next.js frontend. Repoint `WS_HOST`/`WS_PORT` to wherever you deploy `backend/` — the old Vercel URL only serves the dashboard now.
+> The firmware talks to the **Express backend's API**, not the Next.js frontend. Repoint `API_HOST`/`API_PORT` to wherever you deploy `backend/` — the old Vercel URL only serves the dashboard now.
 
 ### Flashing the NodeMCU
 1. Connect the NodeMCU to your computer via micro-USB.
@@ -277,12 +272,11 @@ const char* DEVICE_TOKEN = "your-device-token";
 4. Open **Tools > Serial Monitor** and set the baud rate to **115200**.
 5. You will see:
    - Wi-Fi connection status and IP address
-   - `WebSocket connected → authenticating → WebSocket authenticated`
-   - A one-time state sync after authentication
+   - NTP time sync (needed for TLS certificate validation + the timestamp field)
    - Continuous sensor readings every ~700ms
    - Debounce status and transition logs
-   - `State sent: sitting/away` on confirmed transitions
-   - `WebSocket disconnected / reconnecting` on connection loss
+   - `[API] Telemetry POST: <state> @ <distance> cm → HTTP 200` every 2.5s
+   - `[API] Connect failed — offline, sensing continues` when the backend is unreachable (retried automatically on the next cycle)
 
 ---
 
@@ -290,56 +284,56 @@ const char* DEVICE_TOKEN = "your-device-token";
 
 | Edge Case | Solution & Handling |
 | :--- | :--- |
-| **NodeMCU restarts while sitting** | Device reconnects, authenticates and syncs its current state over the WebSocket. Backend checks if an active session already exists — if yes, it returns `already_active` without creating a duplicate. |
-| **Duplicate START / STOP events** | Idempotent design. Redundant `state_change: sitting` returns the active session; redundant `state_change: away` is a safe no-op. |
-| **Unexpected device disconnect** | Detected instantly via the WebSocket close/missed pings. The session stays active for a grace window — if the device reconnects (its 5 s retry), the same session continues; if it stays offline, the `/status` stale-check closes it (~30 s) with `ended_at` = last-contact time. |
-| **State change while offline** | The firmware holds only its current state; after reconnect + authentication it sends that single current state. Stale events are never replayed, and idempotent handling prevents duplicate sessions. |
-| **Stale TCP connection (device silently unreachable)** | Two keepalive layers: the ESP pings every 15s, the backend pings every 30s; a missed pong terminates the socket, which then triggers the disconnect handling above. |
+| **NodeMCU restarts while sitting** | The device's first telemetry POST carries its current state; the backend checks if an active session already exists — if yes, posture handling is idempotent and no duplicate session is created. |
+| **Duplicate state snapshots** | Idempotent design. The backend edge-detects state per device: unchanged snapshots (e.g. `attentive` every 2.5s while sitting) are safe no-ops with zero DB impact; `vacant` with no active session is a safe no-op. |
+| **Device stops posting (power-off, Wi-Fi loss)** | No dedicated ping/pong — the telemetry POST *is* the heartbeat. The session stays active for a grace window; the `/status` stale-check closes it (~30 s) with `ended_at` = last-contact time. The dashboard also shows "waiting for sensor…" once the last distance reading is >30 s old. |
+| **Backend unavailable** | Sensing never stops. The device skips the POST and retries on the next 2.5 s cycle; the first successful POST after recovery carries the full current state, so nothing is queued or replayed and no stale event is ever sent. |
 | **Session crossing midnight** | The statistics engine computes the mathematical intersection between any session `[started_at, ended_at]` and the day's boundaries `[00:00:00, 23:59:59]`. A session starting at 23:45 and ending at 00:30 correctly attributes 15m to yesterday and 30m to today. |
-| **Malformed / hostile WebSocket messages** | 4 KB frame cap, binary-frame rejection, safe JSON parsing, and per-message error replies. A bad message can never crash the server. |
-| **Server as single source of truth** | The NodeMCU does NOT generate timestamps. Server clock (`new Date()`) sets `started_at`, `ended_at`, and `duration_seconds`. |
+| **Malformed / hostile HTTP requests** | Every device request is Bearer-authenticated (`401/403` on bad tokens) and body-validated (`400` on bad `state`/`distance`/`timestamp`). JSON parse errors are handled by a safe Express error handler that can never crash the server. |
+| **Server as single source of truth** | The device's `timestamp` field is informational only. Server clock (`new Date()`) sets `started_at`, `ended_at`, and `duration_seconds`. |
 | **Active Session Live Ticking** | The frontend uses `started_at` from the server to tick locally every second, preventing unnecessary database writes. |
 
 ---
 
 ## 🧪 Testing
 
-### WebSocket device (no hardware needed)
+### HTTP device simulator (no hardware needed)
 
-A device simulator is included at [`backend/scripts/ws-device-simulator.mjs`](./backend/scripts/ws-device-simulator.mjs). Run it from `backend/` with `DEVICE_TOKEN` exported (or pass `--token=…`):
+A device simulator is included at [`backend/scripts/device-simulator.mjs`](./backend/scripts/device-simulator.mjs). It mimics the real firmware: authenticated state-snapshot POSTs to `/api/sitting/heartbeat`. Run it from `backend/` (it reads `DEVICE_TOKEN` from `backend/.env`, or pass `--token=…`):
 
 ```bash
 cd backend
-export DEVICE_TOKEN=your-device-token
 
-node scripts/ws-device-simulator.mjs sit        # open a session
-node scripts/ws-device-simulator.mjs sit        # again → already_active, no duplicate
-node scripts/ws-device-simulator.mjs away       # close the session (prints duration ack)
-node scripts/ws-device-simulator.mjs crash      # sit, then hard-drop → session auto-closes via stale-check (~30s)
-node scripts/ws-device-simulator.mjs reconnect  # sit → drop → reconnect → sync → away
-node scripts/ws-device-simulator.mjs badtoken   # expect auth_error + close 4001
-node scripts/ws-device-simulator.mjs sensor     # stream live distance readings (watch dashboard/SSE)
-node scripts/ws-device-simulator.mjs malformed  # garbage frames → error replies, server alive
-node scripts/ws-device-simulator.mjs twice      # second connection with same deviceId supersedes first
+node scripts/device-simulator.mjs attentive  # open a session (one snapshot POST)
+node scripts/device-simulator.mjs attentive  # again → unchanged snapshot, no duplicate
+node scripts/device-simulator.mjs relax      # switch the active session to relaxing
+node scripts/device-simulator.mjs vacant     # close the session
+node scripts/device-simulator.mjs stream     # emulate the real device: POST every 2.5s (Ctrl+C to stop)
+node scripts/device-simulator.mjs crash      # one sitting snapshot, then go silent → stale-check closes the session (~30s after the next status poll)
+node scripts/device-simulator.mjs reconnect  # sit → 3s dropout → sit again → verifies no duplicate session
+node scripts/device-simulator.mjs sensor     # distance-only snapshots cycling every posture band (watch the dashboard)
+node scripts/device-simulator.mjs badtoken   # expect 401/403
+node scripts/device-simulator.mjs malformed  # invalid JSON/state → expect 400, server alive
 ```
 
+Options: `--url=http://localhost:4000` · `--token=…` · `--id=sitting-tracker-01` · `--state=attentive` · `--distance=20.0` (for `stream`).
+
 > [!WARNING]
-> Every authenticated simulator connection that disconnects **closes the active sitting session** (by design). Don't run `sit`/`crash`/`reconnect` while your real device is mid-session.
+> The simulator writes real sessions to whatever Supabase your backend points at. Don't run `attentive`/`vacant`/`crash`/`reconnect` while your real device is mid-session.
 
 ### HTTP endpoints via cURL
 
 ```bash
-# Device-side endpoints (kept for manual testing; the firmware no longer uses them)
-curl -X POST http://localhost:4000/api/sitting/start \
-  -H "Authorization: Bearer your-device-token" -H "Content-Type: application/json"
-
-curl -X POST http://localhost:4000/api/sitting/stop \
-  -H "Authorization: Bearer your-device-token" -H "Content-Type: application/json"
+# Device telemetry endpoint (the firmware's only endpoint)
+curl -X POST http://localhost:4000/api/sitting/heartbeat \
+  -H "Authorization: Bearer your-device-token" \
+  -H "Content-Type: application/json" \
+  -d '{"deviceId":"sitting-tracker-01","distance":20.0,"state":"attentive","timestamp":1759500000}'
 
 # Dashboard endpoints
 curl http://localhost:4000/api/sitting/status
 
-# Gateway status: connected devices + SSE clients
+# Gateway status: recently-online devices + SSE clients
 curl http://localhost:4000/health
 ```
 

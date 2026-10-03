@@ -20,13 +20,15 @@ export function HardwareGuideModal({ isOpen, onClose }: HardwareGuideModalProps)
     setTimeout(() => setCopiedCurl(null), 2000);
   };
 
-  const sampleStartCurl = `curl -X POST http://localhost:3000/api/sitting/start \\
+  const sampleSitCurl = `curl -X POST http://localhost:4000/api/sitting/heartbeat \\
   -H "Authorization: Bearer tracker-secret-device-key-change-me" \\
-  -H "Content-Type: application/json"`;
+  -H "Content-Type: application/json" \\
+  -d '{"deviceId":"sitting-tracker-01","distance":20.0,"state":"attentive","timestamp":1759500000}'`;
 
-  const sampleStopCurl = `curl -X POST http://localhost:3000/api/sitting/stop \\
+  const sampleVacantCurl = `curl -X POST http://localhost:4000/api/sitting/heartbeat \\
   -H "Authorization: Bearer tracker-secret-device-key-change-me" \\
-  -H "Content-Type: application/json"`;
+  -H "Content-Type: application/json" \\
+  -d '{"deviceId":"sitting-tracker-01","distance":60.0,"state":"vacant","timestamp":1759500000}'`;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm animate-in fade-in duration-200">
@@ -90,14 +92,16 @@ export function HardwareGuideModal({ isOpen, onClose }: HardwareGuideModalProps)
               Open <code className="text-acc-emerald-soft">firmware/sitting_tracker/sitting_tracker.ino</code> in the Arduino IDE and customize:
             </p>
             <div className="p-3 rounded-xl bg-well/80 border border-edge font-mono text-xs text-ink3 overflow-x-auto">
-              <pre>{`const char* WIFI_SSID     = "Your_WiFi_Name";
-const char* WIFI_PASSWORD = "Your_WiFi_Password";
+              <pre>{`// Wi-Fi credentials (add as many networks as you need)
+const WifiCredential WIFI_NETWORKS[] = { { "Your_WiFi_Name", "Your_WiFi_Password" } };
 
-// Live Vercel or local URL (e.g., "https://your-app.vercel.app")
-const char* SERVER_BASE_URL = "https://your-app.vercel.app";
+// Backend API URL (the Express backend, NOT the dashboard URL)
+const char* API_HOST = "sitting-track-iot-....run.app";  // or your LAN IP for dev
+const uint16_t API_PORT = 443;                           // 4000 for local dev
+const bool USE_TLS = true;                               // false for local http
 
-// Secret Device Bearer Token (must match DEVICE_TOKEN in .env.local)
-const char* DEVICE_TOKEN    = "tracker-secret-device-key-change-me";`}</pre>
+// Secret Device Bearer Token (must match DEVICE_TOKEN in backend/.env)
+const char* DEVICE_TOKEN = "tracker-secret-device-key-change-me";`}</pre>
             </div>
           </div>
 
@@ -107,39 +111,39 @@ const char* DEVICE_TOKEN    = "tracker-secret-device-key-change-me";`}</pre>
               <Terminal className="w-4 h-4" /> 3. Test Endpoints Directly via Terminal (cURL)
             </h4>
 
-            {/* Test Start */}
+            {/* Test Sit (telemetry snapshot opens/keeps a session) */}
             <div className="space-y-1">
               <div className="flex items-center justify-between text-xs text-ink4">
-                <span>Start Session: <code className="text-acc-emerald-soft">POST /api/sitting/start</code></span>
+                <span>Sit Down (opens session): <code className="text-acc-emerald-soft">POST /api/sitting/heartbeat</code></span>
                 <button
                   type="button"
-                  onClick={() => copyToClipboard(sampleStartCurl, 'start')}
+                  onClick={() => copyToClipboard(sampleSitCurl, 'sit')}
                   className="inline-flex items-center gap-1 text-[11px] text-ink4 hover:text-ink-bright"
                 >
-                  {copiedCurl === 'start' ? <Check className="w-3.5 h-3.5 text-acc-emerald" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedCurl === 'start' ? 'Copied' : 'Copy'}
+                  {copiedCurl === 'sit' ? <Check className="w-3.5 h-3.5 text-acc-emerald" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copiedCurl === 'sit' ? 'Copied' : 'Copy'}
                 </button>
               </div>
               <pre className="p-2.5 rounded-lg bg-well/80 border border-edge text-[11px] font-mono text-ink3 overflow-x-auto">
-                {sampleStartCurl}
+                {sampleSitCurl}
               </pre>
             </div>
 
-            {/* Test Stop */}
+            {/* Test Vacant (closes the session) */}
             <div className="space-y-1">
               <div className="flex items-center justify-between text-xs text-ink4">
-                <span>Stop Session: <code className="text-acc-rose-soft">POST /api/sitting/stop</code></span>
+                <span>Stand Up (closes session): <code className="text-acc-rose-soft">POST /api/sitting/heartbeat</code></span>
                 <button
                   type="button"
-                  onClick={() => copyToClipboard(sampleStopCurl, 'stop')}
+                  onClick={() => copyToClipboard(sampleVacantCurl, 'vacant')}
                   className="inline-flex items-center gap-1 text-[11px] text-ink4 hover:text-ink-bright"
                 >
-                  {copiedCurl === 'stop' ? <Check className="w-3.5 h-3.5 text-acc-emerald" /> : <Copy className="w-3.5 h-3.5" />}
-                  {copiedCurl === 'stop' ? 'Copied' : 'Copy'}
+                  {copiedCurl === 'vacant' ? <Check className="w-3.5 h-3.5 text-acc-emerald" /> : <Copy className="w-3.5 h-3.5" />}
+                  {copiedCurl === 'vacant' ? 'Copied' : 'Copy'}
                 </button>
               </div>
               <pre className="p-2.5 rounded-lg bg-well/80 border border-edge text-[11px] font-mono text-ink3 overflow-x-auto">
-                {sampleStopCurl}
+                {sampleVacantCurl}
               </pre>
             </div>
           </div>
