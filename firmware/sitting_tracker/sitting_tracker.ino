@@ -50,6 +50,7 @@
 
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecure.h>
+#include <BearSSLHelpers.h>
 #include <time.h>
 
 // ==============================================================================
@@ -99,9 +100,10 @@ const bool     USE_TLS  = true;                // true → https:// (Cloud Run);
 
 // Root CA for production https:// — GTS Root R1 (Google Trust Services), the
 // trust anchor for *.run.app certificates. Self-signed, valid 2016–2036.
-// BearSSL validates the full chain (leaf → WR2 → this root) + hostname, so
-// no setInsecure() is used anywhere. NTP time sync runs in setup() because
-// certificate validity checks need a correct clock.
+// BearSSL validates the full certificate chain (leaf → WR2 → this root) and
+// the notValidBefore/After dates against the NTP-synced clock (handed to the
+// client via setX509Time — the core does not read the clock by itself), so
+// no setInsecure() is used anywhere. NTP time sync runs in setup().
 const char* API_CA_CERT =
   "-----BEGIN CERTIFICATE-----\n"
   "MIIFWjCCA0KgAwIBAgIQbkepxUtHDA3sM9CJuRz04TANBgkqhkiG9w0BAQwFADBH\n"
@@ -199,6 +201,10 @@ unsigned long potentialStateStartTime = 0;
 WiFiClientSecure tlsClient;
 WiFiClient plainClient;
 WiFiClient* apiClient = nullptr;
+// Parsed PEM root CA for TLS. The client only keeps a POINTER to this, so it
+// must stay allocated for the app's lifetime. Heap-allocated in setup() when
+// USE_TLS so non-TLS builds don't pay for it.
+BearSSL::X509List* apiTrustAnchors = nullptr;
 
 // Timer for sensor reading loop
 unsigned long lastSensorReadTime = 0;
@@ -249,7 +255,11 @@ void setup() {
         Serial.print(F("."));
       }
       Serial.println();
-      tlsClient.setCACert(API_CA_CERT);
+      // Parse the PEM root CA into BearSSL trust anchors. (Note: ESP8266's
+      // WiFiClientSecure has no setCACert() — that's the ESP32 API — and it
+      // does NOT pick up the NTP clock by itself; see setX509Time() below.)
+      apiTrustAnchors = new BearSSL::X509List(API_CA_CERT);
+      tlsClient.setTrustAnchors(apiTrustAnchors);
     } else {
       Serial.println(F("[TLS] WARNING: USE_TLS=true but API_CA_CERT is empty."));
       Serial.println(F("[TLS] Connecting with UNVALIDATED TLS (no server-identity check)."));
@@ -422,6 +432,13 @@ const char* stateName(State s) {
  */
 bool ensureApiClientConnected() {
   if (apiClient->connected()) return true;
+
+  if (USE_TLS) {
+    // BearSSL checks the certificate's notValidBefore/After against the time
+    // WE hand it — the core never reads the NTP clock on its own. Refresh it
+    // on every (re)connect so a late NTP sync self-heals.
+    tlsClient.setX509Time(time(nullptr));
+  }
 
   Serial.print(F("[API] Connecting to "));
   Serial.print(API_HOST);
