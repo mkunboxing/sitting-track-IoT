@@ -91,7 +91,7 @@ topic: sitting/device/sitting-tracker-01/telemetry
 - **Online/offline (LWT):** on every connect the device publishes a *retained* `"online"` to `sitting/device/<id>/status` and registers a *retained* Last-Will `"offline"`. If the device vanishes without a clean disconnect (power-off, Wi-Fi loss), the broker publishes the LWT after ~1.5× the 15 s keepalive; the backend marks the device offline in its in-memory store (the same state a 30 s HTTP contact gap produces).
 - **QoS:** telemetry publishes at QoS 0 (a snapshot arrives again 2.5 s later, and `stateForMs` keeps session timing exact); status publishes at QoS 1 with retain.
 - **Reconnect:** automatic on both sides — the ESP8266 throttles to one connect attempt per 5 s; the backend (mqtt.js) retries every 5 s and re-subscribes on success.
-- **TLS everywhere, no `setInsecure()`:** the ESP8266 embeds the **ISRG Root X1** CA (EMQX Cloud terminates TLS with a Let's Encrypt certificate) and validates the full chain against the NTP-synced clock; the backend uses `rejectUnauthorized: true` with Node's built-in roots.
+- **TLS everywhere, no `setInsecure()`:** the ESP8266 embeds the **DigiCert Global Root G2** CA — the root EMQX Cloud's console publishes for the deployment — and validates the full chain against the NTP-synced clock; the backend uses `rejectUnauthorized: true` with Node's built-in roots (which already trust DigiCert Global Root G2).
 - **Auth:** broker-level username/password (created in the EMQX Cloud console). The `deviceId` is carried by the topic (`sitting/device/<id>/telemetry`), which is what the backend subscribes to with wildcards.
 
 ### Backend env vars (MQTT)
@@ -315,7 +315,7 @@ const char* DEVICE_TOKEN = "your-device-token";
 ```
 
 > [!NOTE]
-> The **ISRG Root X1** CA needed for EMQX Cloud's TLS is already embedded in the sketch (`MQTT_CA_CERT`) — full chain + hostname validation, no `setInsecure()` anywhere. If you ever swap to a self-hosted broker with a private CA, replace that PEM.
+> The **DigiCert Global Root G2** CA needed for EMQX Cloud's TLS is already embedded in the sketch (`MQTT_CA_CERT` — it's the same certificate the EMQX Cloud console offers for download) — full chain + hostname validation, no `setInsecure()` anywhere. If you ever swap to a different broker, replace that PEM.
 
 ### Flashing the NodeMCU
 1. Connect the NodeMCU to your computer via micro-USB.

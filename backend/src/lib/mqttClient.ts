@@ -36,8 +36,9 @@ import { parseTelemetryPayload, processDeviceTelemetry } from './telemetryProces
  *   MQTT_TELEMETRY_TOPIC  optional, defaults to sitting/device/+/telemetry
  *   MQTT_STATUS_TOPIC     optional, defaults to sitting/device/+/status
  *   MQTT_CA_CERT          optional PEM bundle when the broker uses a private CA
- *                         (EMQX Cloud uses Let's Encrypt — Node's built-in
- *                         roots already trust it; "\n" escapes are unescaped)
+ *                         (EMQX Cloud's *.emqxsl.com certificate chains to
+ *                         DigiCert Global Root G2, which Node's built-in roots
+ *                         already trust; "\n" escapes are unescaped)
  *
  * TLS certificate validation is never disabled (rejectUnauthorized stays
  * true). Reconnection is automatic: mqtt.js retries every reconnectPeriod
@@ -181,8 +182,9 @@ export function startMqttClient(): void {
     reconnectPeriod: 5_000,
     connectTimeout: 30_000,
     // TLS certificate validation is never disabled. EMQX Cloud terminates
-    // TLS with a Let's Encrypt certificate, which Node's built-in roots
-    // trust; MQTT_CA_CERT can supply a bundle for private CAs.
+    // TLS with a certificate chaining to DigiCert Global Root G2, which
+    // Node's built-in roots trust; MQTT_CA_CERT can supply a bundle for
+    // private CAs.
     rejectUnauthorized: true,
     ...(config.caCert ? { ca: config.caCert } : {}),
   });
