@@ -296,6 +296,33 @@ export async function closeActiveSession(endedAt?: Date): Promise<CloseSessionRe
 }
 
 /**
+ * When the currently active session started (epoch ms), or null when none is
+ * active. Used by the MQTT session-events handler (lib/sessionEvents.ts) to
+ * spot stale queued SESSION_ENDED events that predate the active session
+ * (device sat again while the backend was offline) — those must not close
+ * the newer session.
+ */
+export async function getActiveSessionStartedAtMs(): Promise<number | null> {
+  if (!isSupabaseConfigured()) return null;
+
+  try {
+    const supabase = getSupabaseServerClient();
+    const { data, error } = await supabase
+      .from('sitting_sessions')
+      .select('started_at')
+      .is('ended_at', null)
+      .order('started_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return new Date(data.started_at).getTime();
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Liveness touch — keeps last_heartbeat_at fresh while a device keeps posting
  * HTTP telemetry (throttled by the caller). The /status endpoint's
  * stale-session auto-close (30s/8h) keeps working unchanged as a backstop.

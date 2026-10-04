@@ -45,6 +45,24 @@
  *     started_at/ended_at to FIRST DETECTION of the new state (true sit-down /
  *     stand-up moments) and the 5 s / 10 s confirmation windows never inflate
  *     the recorded sitting duration.
+ *   - CONFIRMED session transitions are ALSO published as discrete QoS 1
+ *     events to sitting/device/<deviceId>/events:
+ *       { "eventId": "<deviceId>-<uptimeMillis>-<epochSecs>",
+ *         "type": "SESSION_STARTED" | "SESSION_ENDED",
+ *         "deviceId": "sitting-tracker-01",
+ *         "state": "relaxing|attentive|vacant",
+ *         "timestamp": <epoch secs of the confirmed transition> }
+ *     SESSION_STARTED fires when a vacant → sitting transition is confirmed
+ *     (5 s window), SESSION_ENDED when sitting → vacant is confirmed (10 s
+ *     window); posture switches (relaxing ↔ attentive) never open/close a
+ *     session and produce no event. QoS 1 + the backend's persistent (non-
+ *     clean) MQTT session mean EMQX Cloud buffers these while the backend is
+ *     offline (Render deploy/crash) and replays them on reconnect — the
+ *     backend processes them idempotently by eventId and uses the event's
+ *     own timestamp, so replayed history lands at its true moments. There is
+ *     deliberately NO local event storage on the device: if the device
+ *     itself is offline when a transition confirms, the event is lost and
+ *     the next telemetry snapshot still reconciles the state as today.
  *   - Online/offline status uses MQTT Last-Will-and-Testament: on every
  *     connect the device publishes a retained "online" to
  *     sitting/device/<deviceId>/status, and the broker publishes the
@@ -53,11 +71,10 @@
  *   - Each snapshot is still the device's heartbeat: the backend touches
  *     last_heartbeat_at (throttled) and the /status stale-check auto-closes
  *     the session via that signal if snapshots stop arriving.
- *   - Because every message carries the full current state (not events),
- *     there is nothing to queue or re-sync after an outage: if the broker is
- *     unreachable the device simply keeps sensing, and the next published
- *     snapshot reconciles everything (the backend only acts on state
- *     CHANGES). MQTT reconnects automatically (one attempt per 5 s).
+ *   - Telemetry stays QoS 0 on purpose: because every message carries the
+ *     full current state (not events), a dropped snapshot is reconciled by
+ *     the next one, and `stateForMs` keeps the recorded session timing exact.
+ *     MQTT reconnects automatically (one attempt per 5 s).
  *   - TLS uses the embedded DigiCert Global Root G2 CA (the root EMQX Cloud
  *     itself publishes for the deployment — full chain + hostname validation,
  *     no setInsecure anywhere); NTP sync provides the clock both for
@@ -111,14 +128,19 @@ const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
 // EMQX Cloud console → your deployment → "Connection info" gives the host
 // (mqtts://, port 8883); "Access Management" → "Authentication" is where the
 // username/password below is created. Topics (built in setup() from DEVICE_ID):
-//   sitting/device/<DEVICE_ID>/telemetry — state snapshots
+//   sitting/device/<DEVICE_ID>/telemetry — state snapshots (QoS 0)
 //   sitting/device/<DEVICE_ID>/status    — retained "online" on connect +
 //                                          retained LWT "offline" (the broker
 //                                          publishes it if this device
 //                                          vanishes without a clean disconnect)
+//   sitting/device/<DEVICE_ID>/events    — confirmed session transitions
+//                                          (SESSION_STARTED/ENDED, QoS 1) that
+//                                          the broker buffers for the backend's
+//                                          persistent session while it is offline
 //
-// The backend subscribes to these with wildcards and feeds every message
-// into its shared telemetry pipeline (telemetryProcessor.ts).
+// The backend subscribes to these with wildcards and feeds telemetry into its
+// shared pipeline (telemetryProcessor.ts) and events into its idempotent
+// session-event handler (sessionEvents.ts).
 // ---------------------------------------------------------------------------
 const bool     USE_MQTT       = true;
 const char*    MQTT_HOST      = "zfc11cf7.ala.asia-southeast1.emqxsl.com";
@@ -228,6 +250,7 @@ bool mqttReady = false;   // config parsed + trust anchors loaded
 // Topic strings built in setup() from DEVICE_ID (sized for a 64-char id)
 char MQTT_TELEMETRY_TOPIC[96];
 char MQTT_STATUS_TOPIC[96];
+char MQTT_EVENTS_TOPIC[96];
 
 // Throttled automatic reconnect: one connect attempt per interval. A failed
 // attempt (TCP connect + TLS handshake) is blocking, so never retry hot.
@@ -249,6 +272,7 @@ void setupMqtt();
 bool connectMqtt();
 void ensureMqttConnected();
 bool publishTelemetryMqtt();
+void publishSessionEventMqtt(const char* type, const char* state);
 void connectToWiFi();
 bool tryConnectToNetwork(const WifiCredential& net);
 
@@ -349,19 +373,30 @@ void loop() {
     // (posture only). A fluctuation restarts the pending window, so momentary
     // readings never confirm a transition.
     State measuredState = classifyDistance(distance, debounce.current);
+    State previousState = debounce.current; // remembered for the session-event hook below
     DebounceEvent event = updateDebounce(debounce, measuredState, now);
 
     if (event == DEBOUNCE_RESET) {
       Serial.print(F(" -> Potential shift to: "));
       Serial.print(stateName(debounce.potential));
     } else if (event == DEBOUNCE_CONFIRMED) {
-      // State change is confirmed. Nothing to transmit here — the next
-      // telemetry snapshot (≤ TELEMETRY_INTERVAL_MS away) carries the new
-      // current state.
+      // State change is confirmed. The next telemetry snapshot
+      // (<= TELEMETRY_INTERVAL_MS away) carries the new current state as
+      // usual; session-level transitions are ALSO published as discrete
+      // QoS 1 events (buffered by EMQX while the backend is offline).
       Serial.println();
       Serial.print(F(">>> [STATE CHANGED] Confirmed transition to: "));
       Serial.print(stateName(debounce.current));
       Serial.println(F(" (sent with next telemetry snapshot)"));
+
+      // Confirmed vacant -> sitting opens a session; sitting -> vacant closes
+      // one. Posture switches (relaxing <-> attentive) never open or close a
+      // session, so no event for those.
+      if (previousState == STATE_VACANT && debounce.current != STATE_VACANT) {
+        publishSessionEventMqtt("SESSION_STARTED", stateName(debounce.current));
+      } else if (previousState != STATE_VACANT && debounce.current == STATE_VACANT) {
+        publishSessionEventMqtt("SESSION_ENDED", "vacant");
+      }
     }
 
     Serial.println();
@@ -437,6 +472,7 @@ const char* stateName(State s) {
 void setupMqtt() {
   snprintf(MQTT_TELEMETRY_TOPIC, sizeof(MQTT_TELEMETRY_TOPIC), "sitting/device/%s/telemetry", DEVICE_ID);
   snprintf(MQTT_STATUS_TOPIC, sizeof(MQTT_STATUS_TOPIC), "sitting/device/%s/status", DEVICE_ID);
+  snprintf(MQTT_EVENTS_TOPIC, sizeof(MQTT_EVENTS_TOPIC), "sitting/device/%s/events", DEVICE_ID);
 
   if (strlen(MQTT_CA_CERT) == 0) {
     Serial.println(F("[MQTT] ERROR: MQTT_CA_CERT is empty — MQTT disabled."));
@@ -463,6 +499,8 @@ void setupMqtt() {
   Serial.println(MQTT_TELEMETRY_TOPIC);
   Serial.print(F("[MQTT] Status topic:    "));
   Serial.println(MQTT_STATUS_TOPIC);
+  Serial.print(F("[MQTT] Events topic:    "));
+  Serial.println(MQTT_EVENTS_TOPIC);
   mqttReady = true;
 }
 
@@ -542,6 +580,57 @@ bool publishTelemetryMqtt() {
     Serial.println(F("[MQTT] Publish failed — state held locally, reconciled by the next snapshot"));
   }
   return ok;
+}
+
+/**
+ * Publish one CONFIRMED session event to sitting/device/<id>/events at
+ * QoS 1 (not retained). EMQX queues these for the backend's persistent
+ * (non-clean) MQTT session, so a SESSION_STARTED/SESSION_ENDED that happens
+ * while the backend (Render) is offline is delivered once it reconnects —
+ * the reliability layer for session history. Telemetry snapshots stay QoS 0
+ * fire-and-forget; only these events are buffered.
+ *
+ * The payload carries the device's own event timestamp (NTP-synced epoch
+ * secs — the moment this transition was confirmed) and a unique eventId
+ * (<deviceId>-<uptimeMillis>-<epochSecs>); the backend keys idempotent
+ * processing and true-timestamp session records on both.
+ *
+ * There is deliberately NO local event storage: if the device itself is
+ * offline (Wi-Fi/broker down) when an event confirms, the publish fails and
+ * the event is lost — the next telemetry snapshot still reconciles the
+ * device state exactly as before.
+ */
+void publishSessionEventMqtt(const char* type, const char* state) {
+  if (!USE_MQTT) return;
+  if (!mqttClient.connected()) {
+    Serial.print(F("[MQTT] Session event LOST (not connected): "));
+    Serial.println(type);
+    return;
+  }
+
+  char eventId[48];
+  snprintf(eventId, sizeof(eventId), "%s-%lu-%lu",
+           DEVICE_ID, (unsigned long)millis(), (unsigned long)time(nullptr));
+
+  char payload[224];
+  snprintf(payload, sizeof(payload),
+           "{\"eventId\":\"%s\",\"type\":\"%s\",\"deviceId\":\"%s\",\"state\":\"%s\",\"timestamp\":%lu}",
+           eventId, type, DEVICE_ID, state, (unsigned long)time(nullptr));
+
+  // QoS 1: PubSubClient blocks briefly here waiting for the broker's
+  // PUBACK (socket timeout 10 s) — fine for rare session transitions.
+  bool ok = mqttClient.publish(MQTT_EVENTS_TOPIC, payload, false, 1);
+  if (ok) {
+    Serial.print(F("[MQTT] Session event (QoS 1): "));
+    Serial.print(type);
+    Serial.print(F(" "));
+    Serial.print(state);
+    Serial.print(F(" — "));
+    Serial.println(eventId);
+  } else {
+    Serial.print(F("[MQTT] Session event FAILED (no local storage): "));
+    Serial.println(type);
+  }
 }
 
 // ==============================================================================

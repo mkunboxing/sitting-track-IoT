@@ -1,6 +1,7 @@
 import mqtt from 'mqtt';
 import { markDeviceOffline } from './telemetryStore';
 import { parseTelemetryPayload, processDeviceTelemetry } from './telemetryProcessor';
+import { handleSessionEventMessage } from './sessionEvents';
 
 /**
  * MQTT subscriber (EMQX Cloud) — the device-telemetry transport.
@@ -14,11 +15,27 @@ import { parseTelemetryPayload, processDeviceTelemetry } from './telemetryProces
  *     connect, with a retained Last-Will-and-Testament "offline" that the
  *     broker publishes for it if the device vanishes without a clean
  *     disconnect (power-off, Wi-Fi loss).
+ *   - CONFIRMED session transitions (SESSION_STARTED / SESSION_ENDED) as
+ *     QoS 1 events to `sitting/device/<deviceId>/events` — processed by
+ *     lib/sessionEvents.ts (idempotent, device-timestamped) so session
+ *     history survives this backend being offline (Render deploys,
+ *     restarts): the broker queues them and replays on reconnect.
  *
  * This backend subscribes with wildcards and feeds every telemetry message
  * into the shared pipeline (parseTelemetryPayload → processDeviceTelemetry),
  * so session detection, stateForMs backdating, heartbeat throttling and
  * stale-check behavior are all driven from here.
+ *
+ * Persistent session (offline buffering): this backend connects with a
+ * STABLE client id, clean: false and a sessionExpiryInterval (MQTT 5), so
+ * EMQX keeps its subscription session alive while Render is down and queues
+ * every QoS 1 message on the subscribed topics for replay on reconnect.
+ * Telemetry snapshots are published by the device at QoS 0, so they are NOT
+ * queued — they stay fire-and-forget exactly as before; only the QoS 1
+ * session events (and device status messages) are buffered. The client id
+ * must be stable across restarts for this to work — two backend instances
+ * running simultaneously need distinct MQTT_CLIENT_IDs or they will keep
+ * taking over each other's session.
  *
  * An LWT "offline" marks the device offline in the in-memory telemetry store
  * (cached reading dropped, remembered state cleared) — the same state a 30 s
@@ -29,9 +46,14 @@ import { parseTelemetryPayload, processDeviceTelemetry } from './telemetryProces
  *   MQTT_BROKER_URL       mqtts://<host>:8883   (unset → MQTT disabled)
  *   MQTT_USERNAME         broker credentials created in the EMQX Cloud console
  *   MQTT_PASSWORD
- *   MQTT_CLIENT_ID        optional, defaults to smart-tracking-backend-<pid>-<rand>
+ *   MQTT_CLIENT_ID        optional, defaults to smart-tracking-backend —
+ *                         MUST stay stable (persistent session); set a
+ *                         distinct value per running backend instance
  *   MQTT_TELEMETRY_TOPIC  optional, defaults to sitting/device/+/telemetry
  *   MQTT_STATUS_TOPIC     optional, defaults to sitting/device/+/status
+ *   MQTT_EVENTS_TOPIC     optional, defaults to sitting/device/+/events
+ *   MQTT_SESSION_EXPIRY   optional seconds the broker keeps the offline
+ *                         session (default 7 days)
  *   MQTT_CA_CERT          optional PEM bundle when the broker uses a private CA
  *                         (EMQX Cloud's *.emqxsl.com certificate chains to
  *                         DigiCert Global Root G2, which Node's built-in roots
@@ -49,6 +71,8 @@ interface MqttConfig {
   clientId: string;
   telemetryTopic: string;
   statusTopic: string;
+  eventsTopic: string;
+  sessionExpirySeconds: number;
   caCert?: string;
 }
 
@@ -68,9 +92,11 @@ export function getMqttStatus(): MqttStatus {
     enabled: mqttClient !== null,
     connected: mqttClient?.connected ?? false,
     brokerUrl: config?.brokerUrl ?? null,
-    topics: config ? [config.telemetryTopic, config.statusTopic] : null,
+    topics: config ? [config.telemetryTopic, config.statusTopic, config.eventsTopic] : null,
   };
 }
+
+const DEFAULT_SESSION_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 7 days of offline buffering
 
 function loadConfig(): MqttConfig | null {
   const brokerUrl = process.env.MQTT_BROKER_URL?.trim();
@@ -81,11 +107,16 @@ function loadConfig(): MqttConfig | null {
     brokerUrl,
     username: process.env.MQTT_USERNAME || undefined,
     password: process.env.MQTT_PASSWORD || undefined,
-    clientId:
-      process.env.MQTT_CLIENT_ID?.trim() ||
-      `smart-tracking-backend-${process.pid}-${Math.random().toString(16).slice(2, 8)}`,
+    // Stable across restarts — the persistent (non-clean) session and EMQX's
+    // offline event queue are keyed on this id. Never embed pid/random here.
+    clientId: process.env.MQTT_CLIENT_ID?.trim() || 'smart-tracking-backend',
     telemetryTopic: process.env.MQTT_TELEMETRY_TOPIC?.trim() || 'sitting/device/+/telemetry',
     statusTopic: process.env.MQTT_STATUS_TOPIC?.trim() || 'sitting/device/+/status',
+    eventsTopic: process.env.MQTT_EVENTS_TOPIC?.trim() || 'sitting/device/+/events',
+    sessionExpirySeconds: (() => {
+      const parsed = Number(process.env.MQTT_SESSION_EXPIRY?.trim());
+      return Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SESSION_EXPIRY_SECONDS;
+    })(),
     caCert: caRaw ? caRaw.replace(/\\n/g, '\n') : undefined,
   };
 }
@@ -172,7 +203,13 @@ export function startMqttClient(): void {
     clientId: config.clientId,
     username: config.username,
     password: config.password,
-    clean: true,
+    // Persistent session (MQTT 5): clean start = false + sessionExpiryInterval
+    // keep the subscription session on the broker while this backend is
+    // offline, so EMQX buffers QoS 1 session events and replays them on
+    // reconnect. Telemetry (QoS 0) is never buffered — unchanged behavior.
+    protocolVersion: 5,
+    clean: false,
+    properties: { sessionExpiryInterval: config.sessionExpirySeconds },
     keepalive: 60,
     // Automatic reconnect: mqtt.js retries with this backoff and, on every
     // successful connect, re-subscribes to the topics registered below.
@@ -187,9 +224,11 @@ export function startMqttClient(): void {
   });
 
   mqttClient.on('connect', () => {
-    console.log(`[MQTT] Connected to broker — subscribing to ${config!.telemetryTopic} + ${config!.statusTopic}`);
+    console.log(
+      `[MQTT] Connected to broker — subscribing to ${config!.telemetryTopic} + ${config!.statusTopic} + ${config!.eventsTopic}`
+    );
     mqttClient!.subscribe(
-      [config!.telemetryTopic, config!.statusTopic],
+      [config!.telemetryTopic, config!.statusTopic, config!.eventsTopic],
       { qos: 1 },
       (err) => {
         if (err) console.error('[MQTT] Subscribe failed:', err.message);
@@ -223,6 +262,14 @@ export function startMqttClient(): void {
     const statusDeviceId = deviceIdFromTopic(topic, config!.statusTopic);
     if (statusDeviceId !== null) {
       handleStatusMessage(topic, payload, statusDeviceId).catch((err) => {
+        console.error(`[MQTT] Unhandled error on ${topic}:`, err);
+      });
+      return;
+    }
+
+    const eventsDeviceId = deviceIdFromTopic(topic, config!.eventsTopic);
+    if (eventsDeviceId !== null) {
+      handleSessionEventMessage(topic, payload, eventsDeviceId).catch((err) => {
         console.error(`[MQTT] Unhandled error on ${topic}:`, err);
       });
       return;
