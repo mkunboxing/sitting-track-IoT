@@ -11,8 +11,11 @@ import { getTimezoneDayBoundaries } from './timeUtils';
  * MQTT session-state publisher — pushes the current sitting state to
  * sitting/device/<deviceId>/session (retained, QoS 1) for the mobile MQTT
  * app. The payload is built from the SAME Supabase data the dashboard API
- * serves (lib/sessionState.ts), so MQTT state and dashboard always agree;
- * this module never writes to the database and never opens/closes sessions.
+ * serves (lib/sessionState.ts) — active session, previous session and
+ * date-aware today totals, each with human-readable "HH:MM:SS" duration
+ * twins and friendly IST timestamps alongside the original numeric/ISO
+ * fields — so MQTT state and dashboard always agree; this module never
+ * writes to the database and never opens/closes sessions.
  *
  * Retained + QoS 1: the broker stores the last snapshot per topic, so a
  * mobile app receives the latest state the moment it subscribes — even while

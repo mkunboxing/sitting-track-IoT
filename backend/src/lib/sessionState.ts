@@ -18,6 +18,11 @@ import type { SittingSession } from '../types/sitting';
  * the new date's totals, counting only the post-midnight portion of a session
  * that spans midnight (calculateSessionOverlapWithInterval splits at the
  * boundary; the session itself is never closed at midnight).
+ *
+ * Every numeric duration also carries a formatted "HH:MM:SS" twin and every
+ * session row carries friendly timestamps (startedAtIst/endedAtIst in
+ * APP_TIMEZONE) — additions only; the original numeric/ISO fields stay
+ * unchanged so existing consumers keep working.
  */
 
 /** The app's home timezone for "today" when no per-request timezone exists.
@@ -79,6 +84,26 @@ export interface TodayTotals {
   relaxSeconds: number;
   attentiveSeconds: number;
   longestSessionSeconds: number;
+  // Human-readable twins (same values formatted "HH:MM:SS") — added for the
+  // mobile app; the numeric fields above remain the source of truth.
+  totalHms: string;
+  relaxHms: string;
+  attentiveHms: string;
+  longestHms: string;
+}
+
+/**
+ * A sitting_sessions row plus display-only twins for the mobile app:
+ * friendly timestamps in the app timezone and a formatted duration.
+ * (Fields named *Ist because the deployment runs on IST — they are formatted
+ * in APP_TIMEZONE, which is set to Asia/Kolkata.) Only ADDED keys — every
+ * original row field is untouched.
+ */
+export interface DisplaySittingSession extends SittingSession {
+  startedAtIst: string | null;
+  endedAtIst: string | null;
+  /** HH:MM:SS twin of the row's duration_seconds (null while a session is active) */
+  durationHms: string | null;
 }
 
 export interface SessionStateSnapshot {
@@ -87,12 +112,58 @@ export interface SessionStateSnapshot {
   generatedAt: string;
   /** IANA timezone the today-totals were computed in */
   timezone: string;
-  activeSession: SittingSession | null;
+  activeSession: DisplaySittingSession | null;
   /** now − activeSession.started_at (0 when no active session) */
   activeDurationSeconds: number;
+  /** "HH:MM:SS" twin of activeDurationSeconds */
+  activeDurationHms: string;
   /** Most recently CLOSED session, whatever day it ended */
-  previousSession: SittingSession | null;
+  previousSession: DisplaySittingSession | null;
   today: TodayTotals;
+}
+
+/**
+ * Seconds → zero-padded "HH:MM:SS" (hours unbounded for >24h values).
+ * Returns null for null/undefined/non-finite input.
+ */
+function formatHms(totalSeconds: number | null | undefined): string | null {
+  if (totalSeconds === null || totalSeconds === undefined || !Number.isFinite(totalSeconds)) return null;
+  const s = Math.max(0, Math.floor(totalSeconds));
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${pad(Math.floor(s / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)}`;
+}
+
+/**
+ * ISO timestamp → user-friendly string in the app timezone
+ * (e.g. "Sat, 4 Oct, 10:05 am"). Returns null for null/invalid input.
+ */
+function formatTimestampFriendly(iso: string | null | undefined): string | null {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  try {
+    return new Intl.DateTimeFormat('en-IN', {
+      timeZone: getAppTimezone(),
+      weekday: 'short',
+      day: 'numeric',
+      month: 'short',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+    }).format(date);
+  } catch {
+    return null;
+  }
+}
+
+/** Copy a DB row and attach the display-only twins (originals untouched). */
+function withDisplayFields(row: SittingSession): DisplaySittingSession {
+  return {
+    ...row,
+    startedAtIst: formatTimestampFriendly(row.started_at),
+    endedAtIst: formatTimestampFriendly(row.ended_at),
+    durationHms: formatHms(row.duration_seconds),
+  };
 }
 
 /**
@@ -178,9 +249,10 @@ export async function buildSessionStateSnapshot(now: Date = new Date()): Promise
     deviceId: getDeviceId(),
     generatedAt: now.toISOString(),
     timezone: timeZone,
-    activeSession: (activeSession as SittingSession | null) ?? null,
+    activeSession: activeSession ? withDisplayFields(activeSession as SittingSession) : null,
     activeDurationSeconds,
-    previousSession: (previousSession as SittingSession | null) ?? null,
+    activeDurationHms: formatHms(activeDurationSeconds) ?? '00:00:00',
+    previousSession: previousSession ? withDisplayFields(previousSession as SittingSession) : null,
     today: {
       date: todayDate,
       totalSeconds,
@@ -188,6 +260,10 @@ export async function buildSessionStateSnapshot(now: Date = new Date()): Promise
       relaxSeconds,
       attentiveSeconds,
       longestSessionSeconds,
+      totalHms: formatHms(totalSeconds) ?? '00:00:00',
+      relaxHms: formatHms(relaxSeconds) ?? '00:00:00',
+      attentiveHms: formatHms(attentiveSeconds) ?? '00:00:00',
+      longestHms: formatHms(longestSessionSeconds) ?? '00:00:00',
     },
   };
 }
