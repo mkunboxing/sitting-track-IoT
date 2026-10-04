@@ -1,13 +1,15 @@
 import { Router } from 'express';
 import { getSupabaseServerClient, isSupabaseConfigured } from '../lib/supabase';
 import { eventBroadcaster } from '../lib/eventBroadcaster';
+import { requireAuth } from '../lib/auth';
+import { getUserDeviceIds } from '../lib/devices';
 import {
   openSession,
   closeActiveSession,
   setPosture,
   accumulatePosture,
 } from '../lib/sessionService';
-import { DEVICE_ONLINE_WINDOW_MS, getLatestSensorReading } from '../lib/telemetryStore';
+import { DEVICE_ONLINE_WINDOW_MS, getLatestSensorReadingForDevices } from '../lib/telemetryStore';
 import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '../lib/timeUtils';
 import { postureShareSeconds } from '../lib/sessionState';
 import type { DashboardStatsResponse, DayStats, SittingSession } from '../types/sitting';
@@ -22,12 +24,16 @@ function singleQuery(value: unknown): string | null {
 }
 
 // ─────────────────────────────────────────────────────────────
-// GET /status — dashboard metrics in the caller's local timezone
+// GET /status — dashboard metrics in the caller's local timezone.
+// Authenticated: returns ONLY the caller's own sitting data (sessions are
+// stamped with the owning user via device linking — unlinked-device data is
+// visible to nobody).
 // ─────────────────────────────────────────────────────────────
-sittingRouter.get('/status', async (req, res) => {
+sittingRouter.get('/status', requireAuth, async (req, res) => {
   // Never cache status API response
   res.set('Cache-Control', 'no-store');
 
+  const user = req.authUser!;
   const configured = isSupabaseConfigured();
 
   // Extract client timezone from query param or header (defaults to UTC if missing)
@@ -74,8 +80,12 @@ sittingRouter.get('/status', async (req, res) => {
   try {
     const supabase = getSupabaseServerClient();
 
-    // 1. Fetch active session if any
-    const { data: initialActive, error: activeError } = await supabase
+    // 1. Fetch the globally active session for stale-check hygiene. This runs
+    //    on the active session whatever its owner, so an abandoned session
+    //    (device powered off mid-sit) can never block ANY new session — the
+    //    partial unique index allows at most one active session in total.
+    //    Nothing from it is exposed unless it belongs to the caller.
+    const { data: globalActive, error: activeError } = await supabase
       .from('sitting_sessions')
       .select('*')
       .is('ended_at', null)
@@ -83,14 +93,15 @@ sittingRouter.get('/status', async (req, res) => {
       .limit(1)
       .maybeSingle();
 
-    let activeSession = initialActive;
+    let globalActiveSession = globalActive;
 
     if (activeError) {
       console.error('[API /sitting/status] Error fetching active session:', activeError);
     }
 
     // Auto-detect if device was switched off (heartbeat timeout)
-    if (activeSession) {
+    if (globalActiveSession) {
+      const activeSession = globalActiveSession;
       const lastCheckTime = activeSession.last_heartbeat_at
         ? new Date(activeSession.last_heartbeat_at).getTime()
         : new Date(activeSession.started_at).getTime();
@@ -126,22 +137,31 @@ sittingRouter.get('/status', async (req, res) => {
 
         console.log(`[API] Auto-closed abandoned session ${activeSession.id} because module was powered off.`);
 
-        // Push the close to every dashboard tab instantly (otherwise tabs
-        // would only learn about it from their next status poll).
+        // Push the close to the session owner's dashboard tabs instantly
+        // (otherwise they would only learn about it from the next poll).
         eventBroadcaster.broadcast('stop', {
           session: { ...activeSession, ended_at: autoEndTime, duration_seconds: closedDuration },
           durationSeconds: closedDuration,
-        });
+        }, { userId: activeSession.user_id ?? null });
 
-        activeSession = null;
+        globalActiveSession = null;
       }
     }
 
-    // 2. Fetch all sessions that intersect with the last 7 days (including today)
-    // A session intersects if ended_at is null OR ended_at >= sevenDaysAgoUtc
+    // The caller's active session — with at most one active session globally,
+    // it is simply the global one when it belongs to this user.
+    const activeSession =
+      globalActiveSession && globalActiveSession.user_id === user.id
+        ? globalActiveSession
+        : null;
+
+    // 2. Fetch the caller's sessions that intersect with the last 7 days
+    //    (including today). A session intersects if ended_at is null OR
+    //    ended_at >= sevenDaysAgoUtc. Other users' sessions never appear.
     const { data: recentSessions, error: recentError } = await supabase
       .from('sitting_sessions')
       .select('*')
+      .eq('user_id', user.id)
       .or(`ended_at.gte.${sevenDaysAgoUtc.toISOString()},ended_at.is.null`)
       .order('started_at', { ascending: false });
 
@@ -230,7 +250,10 @@ sittingRouter.get('/status', async (req, res) => {
       };
     });
 
-    const latestSensor = getLatestSensorReading(DEVICE_ONLINE_WINDOW_MS);
+    // Live distance only from devices this user has linked — an unlinked
+    // device's telemetry is exposed to nobody
+    const userDeviceIds = await getUserDeviceIds(user.id);
+    const latestSensor = getLatestSensorReadingForDevices(userDeviceIds, DEVICE_ONLINE_WINDOW_MS);
 
     const responsePayload: DashboardStatsResponse = {
       status: activeSession
@@ -263,21 +286,22 @@ sittingRouter.get('/status', async (req, res) => {
 });
 
 // ─────────────────────────────────────────────────────────────
-// GET /stream — Server-Sent Events (SSE)
-// Web clients connect via `new EventSource('<api>/api/sitting/stream')`.
-// When the device telemetry POST transitions the seating state (or the
-// dashboard calls POST /api/sitting/simulate), an event is pushed through
-// this stream immediately to all clients.
+// GET /stream — Server-Sent Events (SSE), authenticated per user.
+// Web clients connect via `new EventSource('<api>/api/sitting/stream', { withCredentials: true })`.
+// When the device telemetry transitions the seating state (or the dashboard
+// calls POST /api/sitting/simulate), the session owner's tabs are pushed the
+// event immediately; other users' tabs never receive another user's events.
 // ─────────────────────────────────────────────────────────────
-sittingRouter.get('/stream', (req, res) => {
-  eventBroadcaster.addClient(req, res);
+sittingRouter.get('/stream', requireAuth, (req, res) => {
+  eventBroadcaster.addClient(req, res, req.authUser!.id);
 });
 
 // ─────────────────────────────────────────────────────────────
 // POST /simulate — Development / testing helper endpoint:
 // triggers START or STOP directly from the dashboard controls.
+// Authenticated: a simulated session is owned by the logged-in user.
 // ─────────────────────────────────────────────────────────────
-sittingRouter.post('/simulate', async (req, res) => {
+sittingRouter.post('/simulate', requireAuth, async (req, res) => {
   if (!isSupabaseConfigured()) {
     return res.status(503).json({
       success: false,
@@ -285,6 +309,7 @@ sittingRouter.post('/simulate', async (req, res) => {
     });
   }
 
+  const user = req.authUser!;
   try {
     const body = (req.body ?? {}) as Record<string, unknown>;
     const action = body.action;
@@ -298,7 +323,11 @@ sittingRouter.post('/simulate', async (req, res) => {
 
     // Posture actions: set the active session's posture (opens one if vacant)
     if (action === 'relax' || action === 'focus') {
-      const result = await setPosture(action === 'relax' ? 'relaxing' : 'attentive');
+      const result = await setPosture(
+        action === 'relax' ? 'relaxing' : 'attentive',
+        undefined,
+        { userId: user.id }
+      );
 
       if (result.status === 'db_error') {
         return res.status(500).json({ success: false, error: result.error });
@@ -316,7 +345,7 @@ sittingRouter.post('/simulate', async (req, res) => {
     }
 
     if (action === 'start') {
-      const result = await openSession();
+      const result = await openSession('attentive', undefined, { userId: user.id });
 
       if (result.status === 'db_error') {
         return res.status(500).json({ success: false, error: result.error });

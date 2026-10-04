@@ -34,6 +34,18 @@ export type SetPostureResult =
   | { status: 'unchanged'; session: SittingSession | null }
   | { status: 'db_error'; error: string };
 
+/**
+ * Who a newly opened session belongs to. The telemetry pipeline passes the
+ * device's owner (resolved from the devices table — lib/devices.ts); the
+ * dashboard simulate controls pass the logged-in user. null/omitted = the
+ * session is created unowned (user_id null → invisible in every dashboard,
+ * e.g. telemetry from a device nobody has linked).
+ */
+export interface SessionOwner {
+  userId?: string | null;
+  deviceId?: string | null;
+}
+
 export const canUseDatabase = (): boolean => isSupabaseConfigured();
 
 /** Minimal shape of a sitting_sessions row needed for posture math */
@@ -83,7 +95,8 @@ export function currentPostureStretchSeconds(session: PostureSessionRow, now: Da
  */
 export async function openSession(
   posture: PostureState = 'attentive',
-  startedAt?: Date
+  startedAt?: Date,
+  owner?: SessionOwner
 ): Promise<OpenSessionResult> {
   const supabase = getSupabaseServerClient();
 
@@ -107,7 +120,9 @@ export async function openSession(
     }
 
     // 3. Create new session (server clock unless a device-derived start is given;
-    //    the posture stretch begins with the session so no time goes unclassified)
+    //    the posture stretch begins with the session so no time goes unclassified).
+    //    Ownership (user_id/device_id) is stamped at open time from the device's
+    //    linked account — null stays invisible in every dashboard.
     const startIso = (startedAt ?? new Date()).toISOString();
     const { data: newSession, error: insertError } = await supabase
       .from('sitting_sessions')
@@ -120,6 +135,8 @@ export async function openSession(
           posture_changed_at: startIso,
           relax_seconds: 0,
           attentive_seconds: 0,
+          user_id: owner?.userId ?? null,
+          device_id: owner?.deviceId ?? null,
         },
       ])
       .select()
@@ -142,8 +159,8 @@ export async function openSession(
       return { status: 'db_error', error: insertError.message };
     }
 
-    // Broadcast change immediately to all open dashboard tabs (< 20ms)
-    eventBroadcaster.broadcast('start', { session: newSession });
+    // Broadcast change immediately to the owner's open dashboard tabs (< 20ms)
+    eventBroadcaster.broadcast('start', { session: newSession }, { userId: newSession.user_id ?? null });
 
     return { status: 'started', session: newSession };
   } catch (err: unknown) {
@@ -158,7 +175,11 @@ export async function openSession(
  * reports a posture while vacant (e.g. straight into relaxing) — `startedAt`
  * backdates that open to the device's first-detection moment (see openSession).
  */
-export async function setPosture(posture: PostureState, startedAt?: Date): Promise<SetPostureResult> {
+export async function setPosture(
+  posture: PostureState,
+  startedAt?: Date,
+  owner?: SessionOwner
+): Promise<SetPostureResult> {
   const supabase = getSupabaseServerClient();
 
   try {
@@ -176,7 +197,7 @@ export async function setPosture(posture: PostureState, startedAt?: Date): Promi
 
     // Posture reported while vacant — start tracking in that posture
     if (!activeSession) {
-      const opened = await openSession(posture, startedAt);
+      const opened = await openSession(posture, startedAt, owner);
       if (opened.status === 'db_error') return opened;
       if (opened.status === 'started') return { status: 'updated', session: opened.session };
       return { status: 'unchanged', session: opened.session };
@@ -208,15 +229,15 @@ export async function setPosture(posture: PostureState, startedAt?: Date): Promi
       return { status: 'db_error', error: updateError.message };
     }
 
-    // Lightweight push to all dashboard tabs — carries the new posture and
-    // the updated totals so clients can refresh without waiting for a poll.
+    // Lightweight push to the owner's dashboard tabs — carries the new posture
+    // and the updated totals so clients can refresh without waiting for a poll.
     eventBroadcaster.broadcastEvent('POSTURE_CHANGE', {
       sessionId: updatedSession.id,
       state: posture,
       relaxSeconds,
       attentiveSeconds,
       postureChangedAt: nowIso,
-    });
+    }, { userId: updatedSession.user_id ?? null });
 
     return { status: 'updated', session: updatedSession };
   } catch (err: unknown) {
@@ -285,8 +306,8 @@ export async function closeActiveSession(endedAt?: Date): Promise<CloseSessionRe
       return { status: 'db_error', error: updateError.message };
     }
 
-    // Broadcast change immediately to all open dashboard tabs (< 20ms)
-    eventBroadcaster.broadcast('stop', { session: updatedSession, durationSeconds });
+    // Broadcast change immediately to the owner's open dashboard tabs (< 20ms)
+    eventBroadcaster.broadcast('stop', { session: updatedSession, durationSeconds }, { userId: updatedSession.user_id ?? null });
 
     return { status: 'stopped', session: updatedSession, durationSeconds };
   } catch (err: unknown) {

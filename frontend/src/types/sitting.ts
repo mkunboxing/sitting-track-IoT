@@ -15,6 +15,10 @@ export interface SittingSession {
   /** Completed attentive seconds; the running stretch is computed from posture_changed_at */
   attentive_seconds: number;
   created_at: string;
+  /** Owning dashboard account (null = unlinked-device session, visible to nobody) */
+  user_id?: string | null;
+  /** Arduino device id that produced the session (device-driven sessions) */
+  device_id?: string | null;
 }
 
 export type SittingStatus = 'RELAXING' | 'ATTENTIVE' | 'AWAY';

@@ -94,9 +94,22 @@ export function recordTelemetry(
 export function getLatestSensorReading(
   maxAgeMs?: number
 ): { distanceCm: number; updatedAt: string } | null {
+  return getLatestSensorReadingForDevices(Array.from(readings.keys()), maxAgeMs);
+}
+
+/**
+ * Most recent sensor reading among the given devices only — /status uses this
+ * with the requesting user's linked device ids so an unlinked device's live
+ * distance is never exposed to anyone's dashboard.
+ */
+export function getLatestSensorReadingForDevices(
+  deviceIds: string[],
+  maxAgeMs?: number
+): { distanceCm: number; updatedAt: string } | null {
   let latest: TelemetryEntry | null = null;
-  for (const reading of readings.values()) {
-    if (!latest || reading.updatedAt > latest.updatedAt) latest = reading;
+  for (const deviceId of deviceIds) {
+    const reading = readings.get(deviceId);
+    if (reading && (!latest || reading.updatedAt > latest.updatedAt)) latest = reading;
   }
   if (!latest) return null;
   if (maxAgeMs !== undefined && Date.now() - latest.lastContactAt > maxAgeMs) return null;

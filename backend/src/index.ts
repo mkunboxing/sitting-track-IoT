@@ -1,7 +1,10 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import cookieParser from 'cookie-parser';
 import { sittingRouter } from './routes/sitting';
+import { authRouter } from './routes/auth';
+import { devicesRouter } from './routes/devices';
 import { eventBroadcaster } from './lib/eventBroadcaster';
 import { getOnlineDeviceIds } from './lib/telemetryStore';
 import { getMqttStatus, startMqttClient } from './lib/mqttClient';
@@ -9,7 +12,9 @@ import { initSessionStatePublisher } from './lib/sessionStatePublisher';
 
 const app = express();
 
-// CORS: allow the Next.js frontend origin(s) configured via CORS_ORIGIN (comma-separated)
+// CORS: allow the Next.js frontend origin(s) configured via CORS_ORIGIN (comma-separated).
+// credentials: true — the auth cookie must ride along on cross-origin
+// frontend→API calls (Vercel → Render in production).
 const allowedOrigins = (process.env.CORS_ORIGIN || '*')
   .split(',')
   .map((origin) => origin.trim())
@@ -18,12 +23,19 @@ const allowedOrigins = (process.env.CORS_ORIGIN || '*')
 app.use(
   cors({
     origin: allowedOrigins.includes('*') ? true : allowedOrigins,
+    credentials: true,
     methods: ['GET', 'POST'],
     allowedHeaders: ['Content-Type', 'Authorization', 'x-timezone', 'x-timezone-offset', 'Cache-Control'],
   })
 );
 
 app.use(express.json());
+app.use(cookieParser());
+
+// User accounts (signup/login/logout) + device linking — all cookie-based.
+// Device/MQTT telemetry stays completely separate (no auth here).
+app.use('/api/auth', authRouter);
+app.use('/api/devices', devicesRouter);
 
 app.use('/api/sitting', sittingRouter);
 

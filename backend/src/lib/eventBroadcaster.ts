@@ -19,8 +19,20 @@ export interface BroadcastListenerInfo {
   payload?: Record<string, unknown>;
 }
 
+/**
+ * Audience restriction for a broadcast. `undefined` = unrestricted (all SSE
+ * clients, e.g. keep-alive events). A `userId` string = only that user's tabs.
+ * `null` = the data belongs to an unowned session/device (unlinked device) and
+ * must not reach ANY dashboard tab. In-process listeners are always notified
+ * (the MQTT session-state publisher is device-scoped, not user-scoped).
+ */
+export interface BroadcastAudience {
+  userId?: string | null;
+}
+
 class EventBroadcaster {
-  private clients: Set<ClientResponse> = new Set();
+  /** SSE response → owning user id (every client authenticates via /stream) */
+  private clients: Map<ClientResponse, string | undefined> = new Map();
   private pingInterval: NodeJS.Timeout | null = null;
   private listeners: Set<(info: BroadcastListenerInfo) => void> = new Set();
 
@@ -39,8 +51,11 @@ class EventBroadcaster {
   /**
    * Register an SSE client. Writes the event-stream headers and the immediate
    * connection acknowledgment, and cleans up when the connection closes.
+   * `userId` scopes which broadcasts the client may receive (undefined =
+   * unrestricted — only appropriate for pre-auth callers, which /stream no
+   * longer has).
    */
-  public addClient(req: Request, res: Response): () => void {
+  public addClient(req: Request, res: Response, userId?: string): () => void {
     res.writeHead(200, {
       'Content-Type': 'text/event-stream; charset=utf-8',
       'Cache-Control': 'no-cache, no-transform, no-store',
@@ -49,7 +64,7 @@ class EventBroadcaster {
     });
     res.flushHeaders();
 
-    this.clients.add(res);
+    this.clients.set(res, userId);
 
     // Send immediate connection acknowledgment
     this.write(
@@ -91,11 +106,14 @@ class EventBroadcaster {
   }
 
   /**
-   * Broadcast an instant status change notification to all open web dashboard tabs
+   * Broadcast an instant status change notification to the authorized open
+   * web dashboard tabs. When `audience` is given, only tabs owned by that
+   * user receive it (null → no tab at all — unowned session/device data).
    */
   public broadcast(
     action: 'start' | 'stop' | 'heartbeat' | 'refresh',
-    payload?: Record<string, unknown>
+    payload?: Record<string, unknown>,
+    audience?: BroadcastAudience
   ): void {
     this.notifyListeners({ type: 'STATUS_CHANGE', action, payload });
     const data = JSON.stringify({
@@ -105,18 +123,22 @@ class EventBroadcaster {
       ...payload,
     });
     const message = `event: message\ndata: ${data}\n\n`;
-    this.sendRaw(message);
+    this.sendTo((clientUserId) => isAllowedByAudience(clientUserId, audience), message);
   }
 
   /**
-   * Push a lightweight custom event (e.g. live distance telemetry) to all
-   * dashboard tabs WITHOUT triggering a status refetch — the payload carries
-   * everything the client needs.
+   * Push a lightweight custom event (e.g. live posture changes) to the
+   * authorized dashboard tabs WITHOUT triggering a status refetch — the
+   * payload carries everything the client needs.
    */
-  public broadcastEvent(type: string, payload?: Record<string, unknown>): void {
+  public broadcastEvent(
+    type: string,
+    payload?: Record<string, unknown>,
+    audience?: BroadcastAudience
+  ): void {
     this.notifyListeners({ type, payload });
     const data = JSON.stringify({ type, timestamp: Date.now(), ...payload });
-    this.sendRaw(`event: message\ndata: ${data}\n\n`);
+    this.sendTo((clientUserId) => isAllowedByAudience(clientUserId, audience), `event: message\ndata: ${data}\n\n`);
   }
 
   private write(res: ClientResponse, text: string): void {
@@ -128,7 +150,7 @@ class EventBroadcaster {
   }
 
   private sendRaw(text: string): void {
-    for (const res of Array.from(this.clients)) {
+    for (const res of Array.from(this.clients.keys())) {
       if (res.destroyed || res.writableEnded) {
         this.clients.delete(res);
         continue;
@@ -137,9 +159,30 @@ class EventBroadcaster {
     }
   }
 
+  private sendTo(allowed: (clientUserId: string | undefined) => boolean, text: string): void {
+    for (const [res, clientUserId] of Array.from(this.clients.entries())) {
+      if (res.destroyed || res.writableEnded) {
+        this.clients.delete(res);
+        continue;
+      }
+      if (!allowed(clientUserId)) continue;
+      this.write(res, text);
+    }
+  }
+
   public getClientCount(): number {
     return this.clients.size;
   }
+}
+
+/** Audience check — see BroadcastAudience. Unscoped clients see nothing scoped. */
+function isAllowedByAudience(
+  clientUserId: string | undefined,
+  audience?: BroadcastAudience
+): boolean {
+  if (audience === undefined) return true;
+  if (audience.userId === null || audience.userId === undefined) return false;
+  return clientUserId !== undefined && clientUserId === audience.userId;
 }
 
 export const eventBroadcaster = new EventBroadcaster();

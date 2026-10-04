@@ -156,6 +156,49 @@ HC-SR04 ECHO (5V) ───[ 1kΩ Resistor ]───┬───► NodeMCU D5 
 
 ---
 
+## 👤 User Accounts & Device Linking
+
+The dashboard is behind a cookie-based login (bcrypt-hashed passwords, HttpOnly session cookie, **no automatic expiry** — logout happens only via the header button or by manually invalidating the `auth_sessions` row). This is completely separate from device/MQTT authentication: the Arduino never sees user accounts, it keeps authenticating at the EMQX broker exactly as before.
+
+### One-time setup (existing installation)
+
+1. **Run the SQL migration** — open the Supabase **SQL Editor** and run [`supabase/migrations/20261004000000_auth_users_devices.sql`](./supabase/migrations/20261004000000_auth_users_devices.sql). It creates the `users`, `auth_sessions` and `devices` tables and adds `user_id`/`device_id` to `sitting_sessions` (nothing is deleted).
+2. **Run the data migration** — from `backend/`:
+
+   ```bash
+   npx tsx --env-file=.env scripts/migrate-auth.ts
+   ```
+
+   This (idempotently):
+   - creates the default test/admin account (`admin` / `admin123` by default — set `ADMIN_USERNAME`/`ADMIN_PASSWORD` in `backend/.env` to choose your own),
+   - assigns **all existing sitting sessions** to that account (and tags them with the device id) so the admin dashboard shows the full history as before,
+   - registers + links your Arduino (`DEVICE_ID`, default `sitting-tracker-01`) to the admin account.
+
+### The flow
+
+> Create account → Login → Dashboard → **Connect Device** → enter device ID → device linked → Arduino data lands on that account.
+
+- New users sign up at `/signup`, log in at `/login`, and connect their device from the **Devices** card on the dashboard.
+- The backend stamps every new sitting session with the linked owner's `user_id` at open time. An **unlinked device's sessions are visible in nobody's dashboard**.
+- A device can be linked to only **one** account; connecting it from another account is rejected until it is disconnected (unlink) first. If a PIN (`device_secret`) is set for a device, claiming it requires that PIN.
+- Only the device owner sees its live distance reading, session events and history.
+
+### API surface (all cookie-authenticated except signup/login)
+
+| Route | Purpose |
+| :--- | :--- |
+| `POST /api/auth/signup` | Create account (duplicate usernames rejected, case-insensitive) |
+| `POST /api/auth/login` | Log in, sets the persistent HttpOnly session cookie |
+| `POST /api/auth/logout` | Invalidates the session row + clears the cookie |
+| `GET /api/auth/me` | Current user (or `null`) |
+| `GET /api/devices` | Devices linked to the logged-in user (+ online status) |
+| `POST /api/devices/connect` | Link a device to the account (optional PIN) |
+| `POST /api/devices/unlink` | Release a device |
+| `GET /api/sitting/*` | Dashboard data — now scoped to the logged-in user |
+
+
+---
+
 ## ⚙️ Environment Variables Configuration
 
 ### Backend — `backend/.env`
@@ -183,6 +226,10 @@ MQTT_PASSWORD=your-emqx-password
 PORT=4000
 # Allowed origin(s) of the Next.js frontend, comma-separated
 CORS_ORIGIN=http://localhost:3000
+
+# Default admin account for scripts/migrate-auth.ts (user auth setup)
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=admin123
 ```
 
 ### Frontend — `frontend/.env.local`

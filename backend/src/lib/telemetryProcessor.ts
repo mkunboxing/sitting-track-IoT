@@ -1,4 +1,5 @@
 import { closeActiveSession, setPosture, touchActiveSessionHeartbeat } from './sessionService';
+import { getDeviceOwnerUserId } from './devices';
 import {
   getLastKnownState,
   recordTelemetry,
@@ -144,8 +145,12 @@ export async function processDeviceTelemetry(
         // moment), not when the confirmation completed / snapshot arrived.
         // After a resumed contact gap the backdate is clamped to the device's
         // previous contact so it never overlaps an already-closed session.
+        // Ownership: resolve the linked account (null while the device is
+        // unlinked — the session then stays invisible in every dashboard) and
+        // stamp it onto any session this edge opens.
+        const ownerUserId = await getDeviceOwnerUserId(deviceId);
         const startedAt = firstDetectedAt(snapshot.stateForMs, resumedAfterGap ? previousContactAt : null);
-        const result = await setPosture(state, startedAt);
+        const result = await setPosture(state, startedAt, { deviceId, userId: ownerUserId });
         switch (result.status) {
           case 'updated':
             console.log(`${log} ${deviceId}: ${state} — session ${result.session.id} posture set to ${state}`);

@@ -1,7 +1,7 @@
 'use client';
 
 import React from 'react';
-import { RefreshCw, Cpu, Wifi, Volume2, VolumeX, Bell, BellOff, Sun, Moon } from 'lucide-react';
+import { RefreshCw, Cpu, Wifi, Volume2, VolumeX, Bell, BellOff, Sun, Moon, LogOut, UserRound } from 'lucide-react';
 import { Logo } from './Logo';
 
 interface HeaderProps {
@@ -15,6 +15,9 @@ interface HeaderProps {
   onToggleSound: () => void;
   notificationPermission: NotificationPermission;
   onRequestNotificationPermission: () => void;
+  /** Logged-in dashboard user (persistent cookie session) */
+  username?: string | null;
+  onLogout?: () => void;
 }
 
 export function Header({
@@ -28,6 +31,8 @@ export function Header({
   onToggleSound,
   notificationPermission,
   onRequestNotificationPermission,
+  username,
+  onLogout,
 }: HeaderProps) {
   const formattedSyncTime = lastUpdated
     ? new Date(lastUpdated).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
@@ -156,6 +161,30 @@ export function Header({
             <Cpu className="w-3.5 h-3.5 text-acc-teal" />
             <span>ESP8266 Guide</span>
           </button>
+
+          {/* Account: signed-in user + logout (persistent session, no auto-logout) */}
+          {username && (
+            <div className="inline-flex items-center gap-1 pl-1.5 pr-1 py-1 rounded-lg bg-chip/90 border border-edge-strong/80">
+              <span
+                className="inline-flex items-center gap-1.5 px-1 text-xs font-medium text-ink3 max-w-[10rem]"
+                title={`Signed in as ${username}`}
+              >
+                <UserRound className="w-3.5 h-3.5 text-acc-emerald shrink-0" />
+                <span className="truncate">{username}</span>
+              </span>
+              {onLogout && (
+                <button
+                  type="button"
+                  onClick={onLogout}
+                  className="inline-flex items-center gap-1 px-2 py-1 rounded-md text-xs font-medium text-ink4 hover:bg-rose-500/10 hover:text-acc-rose-soft transition-colors active:scale-[0.96]"
+                  title="Log out (invalidates this session)"
+                >
+                  <LogOut className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Logout</span>
+                </button>
+              )}
+            </div>
+          )}
 
           {/* Theme toggle — dark ⇄ light (persisted, see layout bootstrap) */}
           <button

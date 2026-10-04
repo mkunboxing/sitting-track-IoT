@@ -1,4 +1,5 @@
 import { closeActiveSession, getActiveSessionStartedAtMs, openSession } from './sessionService';
+import { getDeviceOwnerUserId } from './devices';
 import type { PostureState } from '../types/sitting';
 
 /**
@@ -176,7 +177,14 @@ export async function handleSessionEventMessage(
 
   try {
     if (event.type === 'SESSION_STARTED') {
-      const result = await openSession(event.state as PostureState, eventTime);
+      // Stamp the device's linked account onto the replayed/confirmed open —
+      // same ownership rule as the telemetry pipeline (null while unlinked)
+      const ownerUserId = await getDeviceOwnerUserId(deviceId);
+      const result = await openSession(
+        event.state as PostureState,
+        eventTime,
+        { deviceId, userId: ownerUserId }
+      );
       switch (result.status) {
         case 'started':
           console.log(

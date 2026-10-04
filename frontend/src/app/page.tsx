@@ -7,6 +7,7 @@ import { MetricsGrid } from '@/components/MetricsGrid';
 import { WeeklyChart } from '@/components/WeeklyChart';
 import { SessionHistory } from '@/components/SessionHistory';
 import { HardwareGuideModal } from '@/components/HardwareGuideModal';
+import { ConnectDevice } from '@/components/ConnectDevice';
 import { Logo } from '@/components/Logo';
 import { DashboardStatsResponse } from '@/types/sitting';
 import { soundManager } from '@/lib/soundUtils';
@@ -14,6 +15,7 @@ import { notificationManager } from '@/lib/notificationManager';
 import { backgroundTimer } from '@/lib/backgroundTimer';
 import { formatFriendlyDuration } from '@/lib/timeUtils';
 import { apiUrl } from '@/lib/api';
+import { AuthUser, fetchCurrentUser, logoutRequest } from '@/lib/authClient';
 import { Bell, Flame, ShieldAlert, Sparkles, X, HeartPulse, Volume2, Play, Square } from 'lucide-react';
 
 export default function DashboardPage() {
@@ -24,6 +26,12 @@ export default function DashboardPage() {
   const [simulating, setSimulating] = useState<boolean>(false);
   const [showHardwareGuide, setShowHardwareGuide] = useState<boolean>(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Auth: persistent cookie session. The dashboard renders only for a signed-in
+  // user; everyone else is redirected to /login. No automatic expiry — logout
+  // is explicit (header button or manual session invalidation).
+  const [user, setUser] = useState<AuthUser | null>(null);
+  const [authChecked, setAuthChecked] = useState<boolean>(false);
 
   // Sound & Notification settings
   const [soundEnabled, setSoundEnabled] = useState<boolean>(true);
@@ -97,7 +105,8 @@ export default function DashboardPage() {
     };
   }, []);
 
-  // Fetch status and metrics from server
+  // Fetch status and metrics from server (session cookie sent automatically
+  // via credentials; a 401 means the session is gone → back to /login)
   const fetchStatus = useCallback(async (isBackground = false) => {
     // Background refreshes (2.5s poll + SSE events) coalesce while one is in
     // flight; manual refreshes always run so the loading state always clears.
@@ -107,9 +116,14 @@ export default function DashboardPage() {
       const { url, headers } = getStatusEndpoint();
       const res = await fetch(url, {
         cache: 'no-store',
+        credentials: 'include',
         headers,
       });
 
+      if (res.status === 401) {
+        window.location.replace('/login');
+        throw new Error('Session expired');
+      }
       if (!res.ok) {
         throw new Error(`Server returned HTTP ${res.status}`);
       }
@@ -179,7 +193,7 @@ export default function DashboardPage() {
     }
   }, []);
 
-  // Initial load & setup listeners
+  // Initial load: resolve the session, then first status fetch + listeners
   useEffect(() => {
     let ignore = false;
 
@@ -202,14 +216,33 @@ export default function DashboardPage() {
     window.addEventListener('touchstart', unlockHandler, { passive: true });
     window.addEventListener('keydown', unlockHandler, { passive: true });
 
-    // Initial status fetch
-    const endpoint = getStatusEndpoint();
-    fetch(endpoint.url, { cache: 'no-store', headers: endpoint.headers })
-      .then((res) => {
+    // Resolve the persistent session cookie first — no user → /login.
+    // (The dashboard's data endpoints 401 without it anyway.)
+    const boot = async () => {
+      const me = await fetchCurrentUser();
+      if (ignore) return;
+      if (!me) {
+        window.location.replace('/login');
+        return;
+      }
+      setUser(me);
+      setAuthChecked(true);
+
+      // Initial status fetch (session cookie rides along)
+      const endpoint = getStatusEndpoint();
+      try {
+        const res = await fetch(endpoint.url, {
+          cache: 'no-store',
+          credentials: 'include',
+          headers: endpoint.headers,
+        });
+        if (ignore) return;
+        if (res.status === 401) {
+          window.location.replace('/login');
+          return;
+        }
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        return res.json();
-      })
-      .then((json: DashboardStatsResponse) => {
+        const json: DashboardStatsResponse = await res.json();
         if (!ignore) {
           setData(json);
           previousStatusRef.current = json.status;
@@ -218,13 +251,14 @@ export default function DashboardPage() {
           }
           setIsLoading(false);
         }
-      })
-      .catch((err: unknown) => {
+      } catch (err: unknown) {
         if (!ignore) {
           setErrorMessage(err instanceof Error ? err.message : 'Connection failed');
           setIsLoading(false);
         }
-      });
+      }
+    };
+    boot();
 
     return () => {
       ignore = true;
@@ -236,9 +270,12 @@ export default function DashboardPage() {
 
   // ── Real-Time Session Events (Server-Sent Events) ─────────────────────────
   // Instantly refreshes the dashboard the EXACT millisecond the device's
-  // telemetry POST (or a manual control) transitions the session. Live
-  // distance arrives via the 2.5s HTTP poll below, not via SSE.
+  // telemetry transitions the session. Live distance arrives via the 2.5s
+  // poll below, not via SSE. The stream is authenticated with the session
+  // cookie and only delivers this user's session events.
   useEffect(() => {
+    if (!user) return;
+
     let es: EventSource | null = null;
     let reconnectTimeout: ReturnType<typeof setTimeout> | null = null;
 
@@ -246,7 +283,7 @@ export default function DashboardPage() {
       if (typeof window === 'undefined') return;
 
       try {
-        es = new EventSource(apiUrl('/api/sitting/stream'));
+        es = new EventSource(apiUrl('/api/sitting/stream'), { withCredentials: true });
 
         es.onmessage = (event) => {
           try {
@@ -283,7 +320,7 @@ export default function DashboardPage() {
       if (reconnectTimeout) clearTimeout(reconnectTimeout);
       es?.close();
     };
-  }, [fetchStatus]);
+  }, [fetchStatus, user]);
 
   // Live polling: every 2.5 seconds via dedicated Web Worker — the primary
   // data channel (session, posture, stats AND the latest distance reported by
@@ -292,7 +329,7 @@ export default function DashboardPage() {
   // stale-session auto-close check. Dedicated Web Workers bypass Chrome's
   // background tab timer throttling completely.
   useEffect(() => {
-    if (!isPolling) {
+    if (!user || !isPolling) {
       backgroundTimer.stop('poll');
       return;
     }
@@ -304,7 +341,7 @@ export default function DashboardPage() {
     return () => {
       backgroundTimer.stop('poll');
     };
-  }, [isPolling, fetchStatus]);
+  }, [user, isPolling, fetchStatus]);
 
   // ── Live tab title ─────────────────────────────────────────────────────────
   // Shows the running session timer (or "Off") in the browser tab strip, so
@@ -357,15 +394,22 @@ export default function DashboardPage() {
     }
   }, [shouldTriggerBreak, breakAlertDismissed, breakIntervalMin]);
 
-  // Simulator / manual action handler
+  // Simulator / manual action handler (authenticated; the session is owned by
+  // the logged-in user)
   const handleSimulate = async (action: 'start' | 'stop' | 'relax' | 'focus') => {
     setSimulating(true);
     try {
       const res = await fetch(apiUrl('/api/sitting/simulate'), {
         method: 'POST',
+        credentials: 'include',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
       });
+
+      if (res.status === 401) {
+        window.location.replace('/login');
+        return;
+      }
 
       const resJson = await res.json();
       if (!res.ok || !resJson.success) {
@@ -379,6 +423,23 @@ export default function DashboardPage() {
       setSimulating(false);
     }
   };
+
+  // Logout: invalidates the server-side session, clears the cookie, then a
+  // full navigation back to the login page
+  const handleLogout = async () => {
+    await logoutRequest();
+    window.location.assign('/login');
+  };
+
+  // Session resolution: show a minimal splash until the auth check lands —
+  // avoids flashing the full dashboard just before a redirect to /login
+  if (!authChecked) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-app text-ink">
+        <Logo size="md" />
+      </div>
+    );
+  }
 
   return (
     <div className="min-h-screen flex flex-col bg-app text-ink">
@@ -394,6 +455,8 @@ export default function DashboardPage() {
         onToggleSound={handleToggleSound}
         notificationPermission={notificationPermission}
         onRequestNotificationPermission={handleEnableAlerts}
+        username={user?.username ?? null}
+        onLogout={handleLogout}
       />
 
       {/* Main Container */}
@@ -561,7 +624,11 @@ export default function DashboardPage() {
           <SessionHistory sessions={data?.todaySessions ?? []} />
         </div>
 
-        {/* 4. Ergonomics & Desk Health Advice Widget */}
+        {/* 4. Connected Arduino devices ("Connect Device") — sitting data is
+            only tracked/shown for devices linked to this account */}
+        <ConnectDevice />
+
+        {/* 5. Ergonomics & Desk Health Advice Widget */}
         <div className="p-5 rounded-2xl border border-edge/80 bg-gradient-to-br from-panel/60 via-panel/40 to-app text-xs text-ink4 space-y-3">
           <div className="flex items-center gap-2 text-ink2 font-semibold text-sm">
             <HeartPulse className="w-4 h-4 text-acc-emerald" />
