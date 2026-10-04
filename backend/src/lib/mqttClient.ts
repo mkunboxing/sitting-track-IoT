@@ -2,6 +2,7 @@ import mqtt from 'mqtt';
 import { markDeviceOffline } from './telemetryStore';
 import { parseTelemetryPayload, processDeviceTelemetry } from './telemetryProcessor';
 import { handleSessionEventMessage } from './sessionEvents';
+import { getSessionStateTopic } from './sessionState';
 
 /**
  * MQTT subscriber (EMQX Cloud) — the device-telemetry transport.
@@ -36,6 +37,13 @@ import { handleSessionEventMessage } from './sessionEvents';
  * must be stable across restarts for this to work — two backend instances
  * running simultaneously need distinct MQTT_CLIENT_IDs or they will keep
  * taking over each other's session.
+ *
+ * Outbound: the backend also PUBLISHES a retained QoS 1 session-state
+ * snapshot (active session, previous session, today's date-aware totals) to
+ * sitting/device/<deviceId>/session for the mobile MQTT app — built from the
+ * same Supabase data as the dashboard API by lib/sessionStatePublisher.ts.
+ * Retained delivery gives the app the latest state the instant it
+ * subscribes, even while this backend is offline.
  *
  * An LWT "offline" marks the device offline in the in-memory telemetry store
  * (cached reading dropped, remembered state cleared) — the same state a 30 s
@@ -94,6 +102,59 @@ export function getMqttStatus(): MqttStatus {
     brokerUrl: config?.brokerUrl ?? null,
     topics: config ? [config.telemetryTopic, config.statusTopic, config.eventsTopic] : null,
   };
+}
+
+// ── Session-state publishing (mobile app) ───────────────────────────────────
+// The backend PUBLISHES (it does not subscribe) a retained QoS 1 snapshot of
+// the current sitting state to sitting/device/<deviceId>/session — see
+// lib/sessionStatePublisher.ts, which builds the payload from the same
+// Supabase data the dashboard API serves. Retained means a mobile MQTT app
+// receives the latest state the moment it subscribes, even while this
+// backend is offline.
+
+/** Fired on every successful broker connect (first connect + each reconnect). */
+type OnConnectedCallback = () => void;
+const onConnectedCallbacks: OnConnectedCallback[] = [];
+
+/**
+ * Register a callback that runs after every successful (re)connect — used by
+ * the session-state publisher to refresh the retained snapshot with a fresh
+ * Supabase read (covers backend restarts, Render wake-ups and reconnects).
+ */
+export function registerOnConnected(cb: OnConnectedCallback): void {
+  onConnectedCallbacks.push(cb);
+}
+
+function runOnConnectedCallbacks(): void {
+  for (const cb of onConnectedCallbacks) {
+    try {
+      cb();
+    } catch (err) {
+      console.error('[MQTT] on-connected callback failed:', err);
+    }
+  }
+}
+
+/**
+ * Publish one session-state snapshot (retained, QoS 1). Callers build the
+ * payload via lib/sessionState.ts. Returns false when MQTT is disabled.
+ * While the client is temporarily disconnected mqtt.js buffers the publish
+ * and flushes it on reconnect; the retained copy on the broker is then
+ * replaced with this fresher state.
+ */
+export function publishSessionStateMessage(payload: Record<string, unknown>): boolean {
+  if (!mqttClient) return false;
+
+  const topic = getSessionStateTopic();
+  const json = JSON.stringify(payload);
+  mqttClient.publish(topic, json, { qos: 1, retain: true }, (err) => {
+    if (err) {
+      console.error(`[MQTT] Session-state publish to ${topic} failed:`, err.message);
+    } else {
+      console.log(`[MQTT] Session-state retained → ${topic} (${json.length} bytes)`);
+    }
+  });
+  return true;
 }
 
 const DEFAULT_SESSION_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 7 days of offline buffering
@@ -234,6 +295,10 @@ export function startMqttClient(): void {
         if (err) console.error('[MQTT] Subscribe failed:', err.message);
       }
     );
+    // Refresh the mobile app's retained session state on every (re)connect —
+    // the snapshot is rebuilt from Supabase with the CURRENT date, so a
+    // backend that slept through midnight republishes correct new-day totals.
+    runOnConnectedCallbacks();
   });
 
   mqttClient.on('reconnect', () => {

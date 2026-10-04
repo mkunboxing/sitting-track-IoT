@@ -10,9 +10,19 @@ import type { Request, Response } from 'express';
 
 type ClientResponse = Response;
 
+/** What in-process listeners (e.g. the MQTT session-state publisher) receive. */
+export interface BroadcastListenerInfo {
+  /** 'STATUS_CHANGE' (session open/close) or a custom type like 'POSTURE_CHANGE' */
+  type: string;
+  /** For STATUS_CHANGE broadcasts: the action ('start' | 'stop' | ...) */
+  action?: string;
+  payload?: Record<string, unknown>;
+}
+
 class EventBroadcaster {
   private clients: Set<ClientResponse> = new Set();
   private pingInterval: NodeJS.Timeout | null = null;
+  private listeners: Set<(info: BroadcastListenerInfo) => void> = new Set();
 
   constructor() {
     this.startHeartbeat();
@@ -56,12 +66,38 @@ class EventBroadcaster {
   }
 
   /**
+   * Register an in-process listener that is notified about every broadcast
+   * (SSE clients are unaffected). Returns an unsubscribe function. Used by
+   * the MQTT session-state publisher to observe session open/close/posture
+   * changes from every pipeline (telemetry, session events, simulate
+   * controls, /status stale auto-close) without coupling it into
+   * sessionService. Listener errors never break SSE broadcasting.
+   */
+  public addListener(cb: (info: BroadcastListenerInfo) => void): () => void {
+    this.listeners.add(cb);
+    return () => {
+      this.listeners.delete(cb);
+    };
+  }
+
+  private notifyListeners(info: BroadcastListenerInfo): void {
+    for (const cb of Array.from(this.listeners)) {
+      try {
+        cb(info);
+      } catch (err) {
+        console.error('[SSE] Broadcast listener failed:', err);
+      }
+    }
+  }
+
+  /**
    * Broadcast an instant status change notification to all open web dashboard tabs
    */
   public broadcast(
     action: 'start' | 'stop' | 'heartbeat' | 'refresh',
     payload?: Record<string, unknown>
   ): void {
+    this.notifyListeners({ type: 'STATUS_CHANGE', action, payload });
     const data = JSON.stringify({
       type: 'STATUS_CHANGE',
       action,
@@ -78,6 +114,7 @@ class EventBroadcaster {
    * everything the client needs.
    */
   public broadcastEvent(type: string, payload?: Record<string, unknown>): void {
+    this.notifyListeners({ type, payload });
     const data = JSON.stringify({ type, timestamp: Date.now(), ...payload });
     this.sendRaw(`event: message\ndata: ${data}\n\n`);
   }

@@ -272,6 +272,7 @@ void setupMqtt();
 bool connectMqtt();
 void ensureMqttConnected();
 bool publishTelemetryMqtt();
+bool publishMqttQos1(const char* topic, const char* payload);
 void publishSessionEventMqtt(const char* type, const char* state);
 void connectToWiFi();
 bool tryConnectToNetwork(const WifiCredential& net);
@@ -583,6 +584,65 @@ bool publishTelemetryMqtt() {
 }
 
 /**
+ * Publish one MQTT 3.1.1 PUBLISH packet at QoS 1. PubSubClient 2.8 has no
+ * QoS parameter on publish() — it is hardwired to QoS 0 — and QoS 1 is
+ * REQUIRED for the session events: EMQX only queues QoS >= 1 messages for
+ * the backend's persistent (non-clean) session while the backend is
+ * offline, so a QoS 0 event would defeat the offline-buffering feature.
+ *
+ * This writes exactly the packet the library itself writes in publish()
+ * (fixed header + remaining-length varint + topic + payload), with the QoS 1
+ * flag and a packet id added, through PubSubClient's own write() passthrough
+ * so its keepalive bookkeeping (lastOutActivity) stays correct. The
+ * broker's PUBACK is drained and ignored by PubSubClient::loop() (readPacket
+ * consumes the whole packet; the type switch has no PUBACK case), so nothing
+ * else is needed. Without local storage there is nothing to retry an
+ * unacked event against — a failed or partial write is treated as a lost
+ * event, same as every other offline publish here.
+ */
+bool publishMqttQos1(const char* topic, const char* payload) {
+  if (!USE_MQTT || !mqttClient.connected()) return false;
+
+  const uint16_t topicLen = (uint16_t)strlen(topic);
+  const uint16_t payloadLen = (uint16_t)strlen(payload);
+  const uint32_t remainingLength = 2u + topicLen + 2u + payloadLen; // topic field + packet id + payload
+
+  // Fixed header (1) + up to 4 length bytes + topic field + packet id + payload
+  const uint16_t PACKET_BUF_SIZE = 5 + 2 + 96 + 2 + 224; // topic max 96, payload max 224
+  uint8_t packet[PACKET_BUF_SIZE];
+
+  uint16_t pos = 0;
+  packet[pos++] = MQTTPUBLISH | MQTTQOS1; // 0x32: PUBLISH, QoS 1, no retain, no dup
+  // Remaining-length varint (1-4 bytes, 7 bits each, high bit = continue)
+  uint32_t len = remainingLength;
+  do {
+    uint8_t digit = len & 0x7F;
+    len >>= 7;
+    if (len > 0) digit |= 0x80;
+    packet[pos++] = digit;
+  } while (len > 0);
+
+  if (pos + 2u + topicLen + 2u + payloadLen > PACKET_BUF_SIZE) return false;
+
+  packet[pos++] = topicLen >> 8;
+  packet[pos++] = topicLen & 0xFF;
+  memcpy(packet + pos, topic, topicLen);
+  pos += topicLen;
+
+  static uint16_t packetId = 0; // must be nonzero for QoS > 0
+  if (++packetId == 0) packetId = 1;
+  packet[pos++] = packetId >> 8;
+  packet[pos++] = packetId & 0xFF;
+
+  memcpy(packet + pos, payload, payloadLen);
+  pos += payloadLen;
+
+  // One atomic write: a partial packet would be a protocol violation, so
+  // require the full write to succeed.
+  return mqttClient.write(packet, pos) == pos;
+}
+
+/**
  * Publish one CONFIRMED session event to sitting/device/<id>/events at
  * QoS 1 (not retained). EMQX queues these for the backend's persistent
  * (non-clean) MQTT session, so a SESSION_STARTED/SESSION_ENDED that happens
@@ -617,9 +677,10 @@ void publishSessionEventMqtt(const char* type, const char* state) {
            "{\"eventId\":\"%s\",\"type\":\"%s\",\"deviceId\":\"%s\",\"state\":\"%s\",\"timestamp\":%lu}",
            eventId, type, DEVICE_ID, state, (unsigned long)time(nullptr));
 
-  // QoS 1: PubSubClient blocks briefly here waiting for the broker's
-  // PUBACK (socket timeout 10 s) — fine for rare session transitions.
-  bool ok = mqttClient.publish(MQTT_EVENTS_TOPIC, payload, false, 1);
+  // QoS 1 via the hand-built packet writer below — PubSubClient 2.8 has no
+  // QoS publish API (see publishMqttQos1). The PUBACK is drained by the
+  // library's loop(); no waiting is needed for rare session transitions.
+  bool ok = publishMqttQos1(MQTT_EVENTS_TOPIC, payload);
   if (ok) {
     Serial.print(F("[MQTT] Session event (QoS 1): "));
     Serial.print(type);

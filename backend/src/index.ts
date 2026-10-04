@@ -5,6 +5,7 @@ import { sittingRouter } from './routes/sitting';
 import { eventBroadcaster } from './lib/eventBroadcaster';
 import { getOnlineDeviceIds } from './lib/telemetryStore';
 import { getMqttStatus, startMqttClient } from './lib/mqttClient';
+import { initSessionStatePublisher } from './lib/sessionStatePublisher';
 
 const app = express();
 
@@ -57,7 +58,10 @@ const port = parseInt(process.env.PORT || '4000', 10);
 app.listen(port, () => {
   console.log(`[SERVER] Smart Tracking API listening on http://localhost:${port}`);
   console.log(`[SERVER] CORS origins: ${allowedOrigins.join(', ')}`);
-  // MQTT telemetry subscriber (EMQX Cloud) — runs alongside the HTTP
-  // heartbeat during the migration; no-ops when MQTT_BROKER_URL is unset.
+  // MQTT telemetry subscriber (EMQX Cloud) — no-ops when MQTT_BROKER_URL is
+  // unset. The session-state publisher then keeps the mobile app's retained
+  // sitting/device/<id>/session snapshot current (open/close/posture,
+  // reconnects, midnight rollover); it no-ops without MQTT too.
   startMqttClient();
+  initSessionStatePublisher();
 });

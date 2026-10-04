@@ -6,10 +6,10 @@ import {
   closeActiveSession,
   setPosture,
   accumulatePosture,
-  currentPostureStretchSeconds,
 } from '../lib/sessionService';
 import { DEVICE_ONLINE_WINDOW_MS, getLatestSensorReading } from '../lib/telemetryStore';
 import { calculateSessionOverlapWithInterval, getTimezoneDayBoundaries } from '../lib/timeUtils';
+import { postureShareSeconds } from '../lib/sessionState';
 import type { DashboardStatsResponse, DayStats, SittingSession } from '../types/sitting';
 
 export const sittingRouter = Router();
@@ -19,41 +19,6 @@ function singleQuery(value: unknown): string | null {
   if (typeof value === 'string') return value;
   if (Array.isArray(value) && typeof value[0] === 'string') return value[0];
   return null;
-}
-
-/**
- * Split a session's overlap with a time window into relax/attentive seconds.
- * The active session's running posture stretch (not yet flushed to the DB) is
- * included; the share is proportional when a session crosses the window edge
- * (e.g. midnight). Leftover time belongs to unclassified (legacy) sessions.
- */
-function postureShareSeconds(
-  session: SittingSession,
-  overlapSeconds: number,
-  now: Date
-): { relax: number; attentive: number } {
-  if (overlapSeconds <= 0) return { relax: 0, attentive: 0 };
-
-  let relax: number;
-  let attentive: number;
-  let totalDuration: number;
-
-  if (session.ended_at === null) {
-    const stretch = currentPostureStretchSeconds(session, now);
-    relax = (session.relax_seconds ?? 0) + (session.posture_state === 'relaxing' ? stretch : 0);
-    attentive = (session.attentive_seconds ?? 0) + (session.posture_state === 'attentive' ? stretch : 0);
-    totalDuration = Math.max(1, Math.floor((now.getTime() - new Date(session.started_at).getTime()) / 1000));
-  } else {
-    relax = session.relax_seconds ?? 0;
-    attentive = session.attentive_seconds ?? 0;
-    totalDuration = session.duration_seconds ?? overlapSeconds;
-  }
-
-  if (totalDuration <= 0) return { relax: 0, attentive: 0 };
-  const share = Math.min(1, overlapSeconds / totalDuration);
-  relax = Math.min(overlapSeconds, Math.round(relax * share));
-  attentive = Math.min(overlapSeconds - relax, Math.round(attentive * share));
-  return { relax, attentive };
 }
 
 // ─────────────────────────────────────────────────────────────
