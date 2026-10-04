@@ -79,6 +79,12 @@
  *     itself publishes for the deployment — full chain + hostname validation,
  *     no setInsecure anywhere); NTP sync provides the clock both for
  *     certificate validation and the timestamp field.
+ *   - Render keep-alive: every 10 minutes the device GETs the backend's
+ *     existing https://<RENDER_HEALTH_HOST>/health over a separate HTTPS
+ *     connection (GTS Root R4-validated TLS) so the Render free tier never
+ *     sleeps and the MQTT backend stays available without the website open.
+ *     Non-blocking between checks; failures are logged and retried next
+ *     interval without touching MQTT/telemetry/session behavior (section 10).
  *
  * Required Arduino libraries: PubSubClient (Nick O'Leary — Library Manager);
  * everything else is the ESP8266 core (built-in WiFiClientSecure/BearSSL).
@@ -199,6 +205,46 @@ const uint16_t MQTT_TLS_TX_BUFFER = 512;
 // username/password above is the actual authentication)
 const char* DEVICE_ID = "sitting-tracker-01";
 
+// ---------------------------------------------------------------------------
+// Render keep-alive heartbeat: every HEALTH_CHECK_INTERVAL_MS the device
+// GETs the backend's EXISTING /health endpoint over HTTPS. Goal: enough
+// periodic traffic to stop the Render free tier from sleeping, so the MQTT
+// backend stays available even when no browser/dashboard is open. The
+// backend URL lives HERE and nowhere else (see section 10 for the client).
+// The health check is advisory only — on any failure it logs and retries at
+// the next interval; MQTT, telemetry and session logic are unaffected.
+// ---------------------------------------------------------------------------
+const char*    RENDER_HEALTH_HOST = "sitting-track-iot.onrender.com";
+const uint16_t RENDER_HEALTH_PORT = 443;
+const char*    RENDER_HEALTH_PATH = "/health";   // the backend's existing health endpoint
+const unsigned long HEALTH_CHECK_INTERVAL_MS   = 10UL * 60UL * 1000UL;  // 10 minutes
+const unsigned long HEALTH_RESPONSE_TIMEOUT_MS = 90UL * 1000UL;         // Render free tier cold-starts on the request (~40 s)
+
+// Root CA for the Render HTTPS connection — GTS Root R4 (Google Trust
+// Services, EC P-384, self-signed, valid 2016–2036). Render terminates TLS
+// with a GTS WE1 certificate chaining to this root (NOT Let's Encrypt —
+// check the served chain if you ever change hosts). Fingerprint
+// 34:9D:FA:40:58:C5:E2:63:12:3B:39:8A:E7:95:57:3C:4E:13:13:C8:3F:E6:8F:93:55:6C:D5:E8:03:1B:3C:7D
+// (matches the OS trust stores; recovered verbatim from the pre-MQTT
+// firmware where it was verified working against this exact host).
+// BearSSL validates the chain + hostname against the NTP-synced clock —
+// no setInsecure anywhere. If you ever move the backend off Render,
+// replace this PEM (openssl s_client -connect <host>:443 -showcerts).
+const char* RENDER_HEALTH_CA_CERT =
+  "-----BEGIN CERTIFICATE-----\n"
+  "MIICCTCCAY6gAwIBAgINAgPlwGjvYxqccpBQUjAKBggqhkjOPQQDAzBHMQswCQYD\n"
+  "VQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2VzIExMQzEUMBIG\n"
+  "A1UEAxMLR1RTIFJvb3QgUjQwHhcNMTYwNjIyMDAwMDAwWhcNMzYwNjIyMDAwMDAw\n"
+  "WjBHMQswCQYDVQQGEwJVUzEiMCAGA1UEChMZR29vZ2xlIFRydXN0IFNlcnZpY2Vz\n"
+  "IExMQzEUMBIGA1UEAxMLR1RTIFJvb3QgUjQwdjAQBgcqhkjOPQIBBgUrgQQAIgNi\n"
+  "AATzdHOnaItgrkO4NcWBMHtLSZ37wWHO5t5GvWvVYRg1rkDdc/eJkTBa6zzuhXyi\n"
+  "QHY7qca4R9gq55KRanPpsXI5nymfopjTX15YhmUPoYRlBtHci8nHc8iMai/lxKvR\n"
+  "HYqjQjBAMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MB0GA1UdDgQW\n"
+  "BBSATNbrdP9JNqPV2Py1PsVq8JQdjDAKBggqhkjOPQQDAwNpADBmAjEA6ED/g94D\n"
+  "9J+uHXqnLrmvT/aDHQ4thQEd0dlq7A/Cr8deVl5c1RxYIigL9zC2L7F8AjEA8GE8\n"
+  "p/SgguMh1YQdc4acLa/KNJvxn7kjNuK8YAOdgLOaVsjh4rsUecrNIdSUtUlD\n"
+  "-----END CERTIFICATE-----\n";
+
 // ==============================================================================
 // 2. HARDWARE PIN DEFINITIONS & THRESHOLDS
 // ==============================================================================
@@ -262,6 +308,19 @@ unsigned long lastSensorReadTime = 0;
 unsigned long lastTelemetryPostTime = 0;   // last telemetry publish time
 float lastMeasuredDistanceCm = -1.0;       // latest reading, sent as telemetry
 
+// Render keep-alive heartbeat state (see section 10). The response wait is a
+// NON-blocking state machine — only the TLS handshake inside connect()
+// briefly blocks (capped by the core at 15 s; normal handshakes take 1–3 s).
+WiFiClientSecure healthTlsClient;          // separate socket from the MQTT one
+BearSSL::X509List* healthTrustAnchors = nullptr;
+bool healthReady = false;                  // config parsed + trust anchors loaded
+bool healthBootCheckDone = false;          // first check fires right after boot Wi-Fi
+bool healthAwaitingResponse = false;       // request sent, polling for the status line
+unsigned long lastHealthCheckMs = 0;
+unsigned long healthAttemptStartMs = 0;
+char healthStatusHead[16];                 // first bytes of the HTTP response ("HTTP/1.1 NNN")
+uint8_t healthStatusLen = 0;
+
 // ==============================================================================
 // 4. FUNCTION DECLARATIONS
 // ==============================================================================
@@ -276,6 +335,10 @@ bool publishMqttQos1(const char* topic, const char* payload);
 void publishSessionEventMqtt(const char* type, const char* state);
 void connectToWiFi();
 bool tryConnectToNetwork(const WifiCredential& net);
+void setupHealthHeartbeat();
+void runHealthHeartbeat(unsigned long now);
+bool startHealthRequest(unsigned long now);
+void finishHealthRequest(bool ok, const char* detail);
 
 // ==============================================================================
 // 5. SETUP
@@ -312,6 +375,9 @@ void setup() {
   if (USE_MQTT) {
     setupMqtt();
   }
+
+  // --- Render keep-alive heartbeat (GET /health every 10 min, section 10) ---
+  setupHealthHeartbeat();
 
   // Initial read to calibrate
   float initialDistance = readDistanceCm();
@@ -411,7 +477,12 @@ void loop() {
     if (mqttReady) mqttClient.loop();
   }
 
-  // 4. Periodic telemetry publish (every TELEMETRY_INTERVAL_MS). Carries the
+  // 4. Render keep-alive heartbeat (GET /health every 10 min). Non-blocking
+  //    state machine — see section 10. Failure is logged and retried at the
+  //    next interval; MQTT, telemetry and sensing are never blocked by it.
+  runHealthHeartbeat(now);
+
+  // 5. Periodic telemetry publish (every TELEMETRY_INTERVAL_MS). Carries the
   //    current state + latest distance; the backend treats it as the device
   //    heartbeat. Silently skipped while offline — sensing continues, and the
   //    next successful publish reconciles everything (it's a state snapshot).
@@ -753,4 +824,151 @@ void connectToWiFi() {
   }
 
   Serial.println(F("[WIFI] All networks exhausted. Will retry in next loop iteration."));
+}
+
+// ==============================================================================
+// 10. RENDER KEEP-ALIVE HEARTBEAT (GET /health every 10 minutes)
+// ==============================================================================
+
+/**
+ * One-time setup: parse the GTS Root R4 trust anchors (Render terminates TLS
+ * with a Google Trust Services WE1 certificate chaining to this root) and
+ * configure the health TLS client. LARGER buffers than MQTT (8 KB rx) on
+ * purpose: Render's edge does not negotiate MFLN, so the server's
+ * certificate record arrives whole and must fit in one buffer. The buffers
+ * are heap-transient (allocated per connect, freed on stop), so this costs
+ * nothing between the 10-minute checks. Full chain + hostname validation
+ * against the NTP clock — no setInsecure anywhere.
+ */
+void setupHealthHeartbeat() {
+  if (strlen(RENDER_HEALTH_CA_CERT) == 0) {
+    Serial.println(F("[HEALTH] ERROR: RENDER_HEALTH_CA_CERT is empty — keep-alive disabled."));
+    return;
+  }
+
+  healthTrustAnchors = new BearSSL::X509List(RENDER_HEALTH_CA_CERT);
+  healthTlsClient.setTrustAnchors(healthTrustAnchors);
+  healthTlsClient.setBufferSizes(8192, 1024);
+  healthReady = true;
+
+  Serial.print(F("[HEALTH] Keep-alive ready: https://"));
+  Serial.print(RENDER_HEALTH_HOST);
+  Serial.println(RENDER_HEALTH_PATH);
+}
+
+/**
+ * Fire one health check. Depends ONLY on Wi-Fi availability — deliberately
+ * NOT on MQTT state: the heartbeat's whole purpose is to wake/keep Render
+ * alive precisely when nothing else is hitting the backend (e.g. the site is
+ * closed and Render went to sleep), so it must run regardless of whether the
+ * MQTT connection is up. Blocking ONLY for the TCP connect + TLS handshake
+ * (~1–3 s normally; the core caps the handshake at 15 s). When MQTT is
+ * connected, telemetry publishes refresh it every 1.5 s, so broker silence
+ * stays well under the ~22 s LWT threshold; when MQTT is down there is no
+ * live connection to lose. The HTTP RESPONSE is awaited non-blocking in
+ * runHealthHeartbeat (Render's free tier cold-starts on this request, which
+ * can take ~40 s — blocking on it would starve PubSubClient's loop() and
+ * trip the LWT).
+ */
+bool startHealthRequest(unsigned long now) {
+  if (!healthReady) return false;
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println(F("[HEALTH] Skipped — Wi-Fi down (retried at the next interval)"));
+    return false;
+  }
+
+  // Start from a clean socket so a half-dead TLS session can't poison this handshake.
+  healthTlsClient.stop();
+  // Certificate validity is checked against the NTP clock we hand BearSSL
+  // (refreshed here so a late sync self-heals).
+  healthTlsClient.setX509Time(time(nullptr));
+  healthStatusLen = 0;
+
+  Serial.print(F("[HEALTH] GET https://"));
+  Serial.print(RENDER_HEALTH_HOST);
+  Serial.println(RENDER_HEALTH_PATH);
+
+  if (!healthTlsClient.connect(RENDER_HEALTH_HOST, RENDER_HEALTH_PORT)) {
+    Serial.println(F("[HEALTH] FAILED — TCP/TLS connect error; retrying at the next interval"));
+    return false;
+  }
+
+  healthTlsClient.print(F("GET "));
+  healthTlsClient.print(RENDER_HEALTH_PATH);
+  healthTlsClient.print(F(" HTTP/1.1\r\nHost: "));
+  healthTlsClient.print(RENDER_HEALTH_HOST);
+  healthTlsClient.print(F("\r\nUser-Agent: sitting-tracker-esp/1.0\r\nConnection: close\r\n\r\n"));
+
+  healthAwaitingResponse = true;
+  healthAttemptStartMs = now;
+  return true;
+}
+
+/** Close the attempt and log the outcome. */
+void finishHealthRequest(bool ok, const char* detail) {
+  healthTlsClient.stop();
+  healthAwaitingResponse = false;
+  if (ok) {
+    Serial.print(F("[HEALTH] HTTP 200 OK — Render keep-alive sent ("));
+    Serial.print(detail);
+    Serial.println(F(")"));
+  } else {
+    Serial.print(F("[HEALTH] FAILED ("));
+    Serial.print(detail);
+    Serial.println(F(") — MQTT/telemetry unaffected; retrying at the next interval"));
+  }
+}
+
+/**
+ * Every loop() pass: fire the boot check (the moment Wi-Fi is up after boot),
+ * then one check per HEALTH_CHECK_INTERVAL_MS, and poll the in-flight
+ * request's status line WITHOUT blocking. Only the first ~12 bytes of the
+ * response are read — "HTTP/1.x 200" is all we need; the rest is discarded
+ * by the close(). Any non-200, early close, or 90 s silence is a logged
+ * failure followed by normal operation until the next interval.
+ */
+void runHealthHeartbeat(unsigned long now) {
+  if (!healthReady) return;
+
+  if (!healthBootCheckDone) {
+    if (WiFi.status() == WL_CONNECTED) {
+      healthBootCheckDone = true;
+      lastHealthCheckMs = now;
+      startHealthRequest(now);
+    }
+  } else if (!healthAwaitingResponse && now - lastHealthCheckMs >= HEALTH_CHECK_INTERVAL_MS) {
+    lastHealthCheckMs = now;
+    startHealthRequest(now);
+  }
+
+  if (!healthAwaitingResponse) return;
+
+  // Drain whatever arrived into the status-line buffer (non-blocking)
+  while (healthTlsClient.available() > 0 && healthStatusLen < sizeof(healthStatusHead) - 1) {
+    healthStatusHead[healthStatusLen++] = (char)healthTlsClient.read();
+  }
+
+  // "HTTP/1.x NNN" — status code sits at bytes 9..11
+  if (healthStatusLen >= 12 && strncmp(healthStatusHead, "HTTP/1.", 7) == 0) {
+    int code = (healthStatusHead[9] - '0') * 100
+             + (healthStatusHead[10] - '0') * 10
+             + (healthStatusHead[11] - '0');
+    if (code == 200) {
+      finishHealthRequest(true, "backend awake");
+    } else {
+      char detail[16];
+      snprintf(detail, sizeof(detail), "HTTP %d", code);
+      finishHealthRequest(false, detail);
+    }
+    return;
+  }
+
+  if (healthTlsClient.available() == 0 && !healthTlsClient.connected()) {
+    finishHealthRequest(false, healthStatusLen > 0 ? "connection closed early" : "no response — connection lost");
+    return;
+  }
+
+  if (now - healthAttemptStartMs >= HEALTH_RESPONSE_TIMEOUT_MS) {
+    finishHealthRequest(false, "no status line — timeout");
+  }
 }
