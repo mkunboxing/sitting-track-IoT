@@ -31,8 +31,8 @@ struct WifiCredential {
 };
 
 const WifiCredential WIFI_NETWORKS[] = {
-  { "Railwire",  "Mk727498" },// Primary network
-  { "Mywifi",    "12343211"}  // Secondary network
+  { "your-wifi-ssid-1",  "your-wifi-password-1" },// Primary network
+  { "your-wifi-ssid-2",  "your-wifi-password-2"}  // Secondary network
   // Add more entries here:
   // { "OfficeWiFi", "officepass" },
 };
@@ -45,8 +45,8 @@ const int WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 // "Access Management" → "Authentication" is where the username/password below
 // is created. Port, client id, topics and TLS setup live in sitting_tracker.ino.
 // ---------------------------------------------------------------------------
-const char* MQTT_HOST     = "zfc11cf7.ala.asia-southeast1.emqxsl.com";
-const char* MQTT_USERNAME = "sitting-iot";
-const char* MQTT_PASSWORD = "Mk727498";
+const char* MQTT_HOST     = "your-deployment.emqxsl.com";
+const char* MQTT_USERNAME = "your-mqtt-username";
+const char* MQTT_PASSWORD = "your-mqtt-password";
 
 #endif // CREDENTIALS_H
