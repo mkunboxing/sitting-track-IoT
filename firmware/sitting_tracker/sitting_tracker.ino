@@ -101,29 +101,21 @@
 // shared verbatim with firmware/tests/debounce_test.cpp
 #include "debounce.h"
 
+// Private secrets (Wi-Fi networks, MQTT broker host/username/password) —
+// gitignored, never committed. First-time setup: copy credentials.example.h
+// (same folder) to credentials.h and fill in your own values.
+#include "credentials.h"
+
 // ==============================================================================
 // 1. CONFIGURATION: Wi-Fi, MQTT Broker, and Device Identity
 // ==============================================================================
 
 // ---------------------------------------------------------------------------
-// Multi-WiFi Configuration
-// Add as many {SSID, Password} pairs as you need.
-// The device will try each network in order and connect to the first available one.
-// If all fail it will retry from the top on each reconnect attempt.
+// Multi-WiFi Configuration — the {SSID, password} network list lives in
+// credentials.h (gitignored; credentials.example.h shows the format). The
+// device will try each network in order and connect to the first available
+// one. If all fail it will retry from the top on each reconnect attempt.
 // ---------------------------------------------------------------------------
-struct WifiCredential {
-  const char* ssid;
-  const char* password;
-};
-
-const WifiCredential WIFI_NETWORKS[] = {
-  { "Railwire",  "Mk727498" },// Primary network
-  { "Mywifi",    "12343211"}  // Secondary network
-  // Add more entries here:
-  // { "OfficeWiFi", "officepass" },
-};
-
-const int WIFI_NETWORK_COUNT = sizeof(WIFI_NETWORKS) / sizeof(WIFI_NETWORKS[0]);
 
 // Timeout (ms) to wait per network before trying the next one
 const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
@@ -133,7 +125,7 @@ const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
 //
 // EMQX Cloud console → your deployment → "Connection info" gives the host
 // (mqtts://, port 8883); "Access Management" → "Authentication" is where the
-// username/password below is created. Topics (built in setup() from DEVICE_ID):
+// username/password in credentials.h is created. Topics (built in setup() from DEVICE_ID):
 //   sitting/device/<DEVICE_ID>/telemetry — state snapshots (QoS 0)
 //   sitting/device/<DEVICE_ID>/status    — retained "online" on connect +
 //                                          retained LWT "offline" (the broker
@@ -149,10 +141,8 @@ const unsigned long WIFI_PER_NETWORK_TIMEOUT = 10000; // 10 seconds each
 // session-event handler (sessionEvents.ts).
 // ---------------------------------------------------------------------------
 const bool     USE_MQTT       = true;
-const char*    MQTT_HOST      = "zfc11cf7.ala.asia-southeast1.emqxsl.com";
+// MQTT_HOST / MQTT_USERNAME / MQTT_PASSWORD live in credentials.h (gitignored)
 const uint16_t MQTT_PORT      = 8883;
-const char*    MQTT_USERNAME  = "sitting-iot";
-const char*    MQTT_PASSWORD  = "Mk727498";
 const char*    MQTT_CLIENT_ID = "sitting-tracker-01";   // must be unique per device
 
 // Root CA for MQTT over TLS — DigiCert Global Root G2. This is the root the
@@ -202,7 +192,7 @@ const uint16_t MQTT_TLS_RX_BUFFER = 512;
 const uint16_t MQTT_TLS_TX_BUFFER = 512;
 
 // This device's identity (sent in the telemetry payload; MQTT broker
-// username/password above is the actual authentication)
+// username/password in credentials.h is the actual authentication)
 const char* DEVICE_ID = "sitting-tracker-01";
 
 // ---------------------------------------------------------------------------

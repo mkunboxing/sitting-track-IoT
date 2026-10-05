@@ -40,3 +40,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# firmware secrets (never commit — see firmware/sitting_tracker/credentials.example.h)
+firmware/sitting_tracker/credentials.h
