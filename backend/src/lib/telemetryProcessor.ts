@@ -1,5 +1,6 @@
-import { closeActiveSession, setPosture, touchActiveSessionHeartbeat } from './sessionService';
+import { resumePostureAfterAway, setPosture, touchActiveSessionHeartbeat } from './sessionService';
 import { getDeviceOwnerUserId } from './devices';
+import { AWAY_GRACE_PERIOD, cancelPendingAway, scheduleAwayClose } from './sessionGrace';
 import {
   getLastKnownState,
   recordTelemetry,
@@ -12,9 +13,10 @@ import type { DeviceSeatingState } from './telemetryStore';
  * Shared device-telemetry pipeline — the single ingestion path for seating
  * state snapshots arriving over MQTT (EMQX Cloud subscriber). Every message
  * gets identical semantics: validate → cache reading → edge-detect →
- * sessionService → throttled heartbeat touch. This module contains no
- * session logic of its own; session open/close/posture lives only in
- * sessionService.ts.
+ * sessionService/sessionGrace → throttled heartbeat touch. This module
+ * contains no session logic of its own: session open/close/posture lives only
+ * in sessionService.ts, and the sitting→vacant grace deferral only in
+ * sessionGrace.ts.
  *
  * Identical snapshots are idempotent here (edge detection compares against
  * the device's last known state), so unchanged 2.5s snapshots are DB-free
@@ -125,43 +127,77 @@ export async function processDeviceTelemetry(
       setLastKnownState(deviceId, state);
 
       if (state === 'vacant') {
-        // Anchor the close to when vacancy was FIRST detected (true stand-up
-        // moment), not when the confirmation completed / snapshot arrived
-        const result = await closeActiveSession(firstDetectedAt(snapshot.stateForMs, null));
+        // Away grace: do NOT close immediately — a brief absence must not end
+        // the session. Arm a pending-away close anchored to when vacancy was
+        // FIRST detected (the original away timestamp); a sitting snapshot
+        // within AWAY_GRACE_PERIOD cancels it and continues the SAME session,
+        // otherwise the session closes at that anchored moment exactly as the
+        // old immediate close did.
+        const awayAt = firstDetectedAt(snapshot.stateForMs, null) ?? new Date();
+        const result = await scheduleAwayClose(deviceId, awayAt.getTime());
         switch (result.status) {
-          case 'stopped':
-            console.log(`${log} ${deviceId}: vacant — session closed, duration ${result.durationSeconds}s`);
+          case 'scheduled':
+            console.log(
+              `${log} ${deviceId}: vacant — pending-away close armed (${AWAY_GRACE_PERIOD / 1000}s grace, session stays open)`
+            );
             break;
           case 'no_active_session':
             // Duplicate vacant / session already closed by the stale-check — safe no-op
             console.log(`${log} ${deviceId}: vacant — no active session, nothing to close`);
             break;
           case 'db_error':
-            console.error(`${log} ${deviceId}: failed to close session:`, result.error);
+            console.error(`${log} ${deviceId}: failed to arm the away-grace close:`, result.error);
             return { ok: false, error: result.error };
         }
       } else {
+        const awayAtMs = cancelPendingAway(deviceId);
+        const ownerUserId = await getDeviceOwnerUserId(deviceId);
         // Anchor the open to when sitting was FIRST detected (true sit-down
         // moment), not when the confirmation completed / snapshot arrived.
         // After a resumed contact gap the backdate is clamped to the device's
         // previous contact so it never overlaps an already-closed session.
-        // Ownership: resolve the linked account (null while the device is
-        // unlinked — the session then stays invisible in every dashboard) and
-        // stamp it onto any session this edge opens.
-        const ownerUserId = await getDeviceOwnerUserId(deviceId);
         const startedAt = firstDetectedAt(snapshot.stateForMs, resumedAfterGap ? previousContactAt : null);
-        const result = await setPosture(state, startedAt, { deviceId, userId: ownerUserId });
-        switch (result.status) {
-          case 'updated':
-            console.log(`${log} ${deviceId}: ${state} — session ${result.session.id} posture set to ${state}`);
-            break;
-          case 'unchanged':
-            // Session already in this posture — safe no-op
-            console.log(`${log} ${deviceId}: ${state} — no posture change needed`);
-            break;
-          case 'db_error':
-            console.error(`${log} ${deviceId}: failed to set posture:`, result.error);
-            return { ok: false, error: result.error };
+
+        if (awayAtMs !== null) {
+          // Return inside the grace window: the pending-away close is
+          // cancelled and the SAME session continues — never a new one. The
+          // away window stays unclassified (resumePostureAfterAway flushes
+          // the posture stretch at the departure moment and re-anchors at
+          // the return), preserving relax/attentive accuracy.
+          const result = await resumePostureAfterAway(state, startedAt ?? new Date(), awayAtMs, {
+            deviceId,
+            userId: ownerUserId,
+          });
+          switch (result.status) {
+            case 'updated':
+              console.log(
+                `${log} ${deviceId}: ${state} — returned within the away grace, session ${result.session.id} continues`
+              );
+              break;
+            case 'unchanged':
+              console.log(`${log} ${deviceId}: ${state} — returned within the away grace, session unchanged`);
+              break;
+            case 'db_error':
+              console.error(`${log} ${deviceId}: failed to resume session after away:`, result.error);
+              return { ok: false, error: result.error };
+          }
+        } else {
+          // Ownership: resolve the linked account (null while the device is
+          // unlinked — the session then stays invisible in every dashboard) and
+          // stamp it onto any session this edge opens.
+          const result = await setPosture(state, startedAt, { deviceId, userId: ownerUserId });
+          switch (result.status) {
+            case 'updated':
+              console.log(`${log} ${deviceId}: ${state} — session ${result.session.id} posture set to ${state}`);
+              break;
+            case 'unchanged':
+              // Session already in this posture — safe no-op
+              console.log(`${log} ${deviceId}: ${state} — no posture change needed`);
+              break;
+            case 'db_error':
+              console.error(`${log} ${deviceId}: failed to set posture:`, result.error);
+              return { ok: false, error: result.error };
+          }
         }
       }
     }

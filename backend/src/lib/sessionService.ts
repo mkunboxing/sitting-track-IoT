@@ -5,8 +5,9 @@ import type { PostureState, SittingSession } from '../types/sitting';
 /**
  * Session lifecycle service — the single source of truth for opening and
  * closing sitting sessions. Shared by the MQTT telemetry subscriber
- * (lib/mqttClient.ts → lib/telemetryProcessor.ts) and the dashboard controls
- * on /simulate so every caller behaves identically.
+ * (lib/mqttClient.ts → lib/telemetryProcessor.ts), the away grace period
+ * (lib/sessionGrace.ts) and the dashboard controls on /simulate so every
+ * caller behaves identically.
  *
  * Atomicity: the database's partial unique index
  * (idx_sitting_sessions_one_active, WHERE ended_at IS NULL) guarantees at
@@ -317,6 +318,89 @@ export async function closeActiveSession(endedAt?: Date): Promise<CloseSessionRe
 }
 
 /**
+ * Continue the active session after a sit-back-down inside the away grace
+ * period (lib/sessionGrace.ts). The session was never closed, so this is a
+ * posture transition — but the away window itself must stay unclassified:
+ * the completed stretch is flushed up to the away moment (`awaySinceMs`,
+ * when vacancy was first detected) and the new stretch starts at the return
+ * moment (`returnedAt`, the device's first detection of sitting). That keeps
+ * relax/attentive seconds exactly as accurate as a hard close+reopen would
+ * have been, while the session — and its duration — continues uninterrupted.
+ *
+ * Falls back to openSession when nothing is active (the session was closed
+ * manually or by the stale-check mid-grace), mirroring setPosture's behavior
+ * of opening on a posture report while vacant.
+ */
+export async function resumePostureAfterAway(
+  posture: PostureState,
+  returnedAt: Date,
+  awaySinceMs: number,
+  owner?: SessionOwner
+): Promise<SetPostureResult> {
+  const supabase = getSupabaseServerClient();
+
+  try {
+    const { data: activeSession, error: fetchError } = await supabase
+      .from('sitting_sessions')
+      .select('*')
+      .is('ended_at', null)
+      .order('started_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (fetchError) {
+      return { status: 'db_error', error: fetchError.message };
+    }
+
+    // The grace outlived the session — the sit-down simply opens a new one
+    if (!activeSession) {
+      const opened = await openSession(posture, returnedAt, owner);
+      if (opened.status === 'db_error') return opened;
+      if (opened.status === 'started') return { status: 'updated', session: opened.session };
+      return { status: 'unchanged', session: opened.session };
+    }
+
+    // Away time belongs to no posture: flush the running stretch at the
+    // departure moment (clamped to the return moment so a quirky device
+    // anchor can never double-count), then restart the stretch at the return.
+    const flushUntilMs = Math.min(awaySinceMs, returnedAt.getTime());
+    const { relaxSeconds, attentiveSeconds } = accumulatePosture(activeSession, new Date(flushUntilMs));
+    const returnedIso = returnedAt.toISOString();
+
+    const { data: updatedSession, error: updateError } = await supabase
+      .from('sitting_sessions')
+      .update({
+        posture_state: posture,
+        posture_changed_at: returnedIso,
+        relax_seconds: relaxSeconds,
+        attentive_seconds: attentiveSeconds,
+      })
+      .eq('id', activeSession.id)
+      .select()
+      .single();
+
+    if (updateError) {
+      return { status: 'db_error', error: updateError.message };
+    }
+
+    // Push the continuation to the owner's dashboard tabs — carries the
+    // (possibly unchanged) posture and the re-anchored totals.
+    eventBroadcaster.broadcastEvent('POSTURE_CHANGE', {
+      sessionId: updatedSession.id,
+      state: posture,
+      relaxSeconds,
+      attentiveSeconds,
+      postureChangedAt: returnedIso,
+    }, { userId: updatedSession.user_id ?? null });
+
+    return { status: 'updated', session: updatedSession };
+  } catch (err: unknown) {
+    console.error('[SESSION] Unexpected error resuming posture after away:', err);
+    return { status: 'db_error', error: 'Internal server error' };
+  }
+}
+
+/**
  * When the currently active session started (epoch ms), or null when none is
  * active. Used by the MQTT session-events handler (lib/sessionEvents.ts) to
  * spot stale queued SESSION_ENDED events that predate the active session
@@ -338,6 +422,32 @@ export async function getActiveSessionStartedAtMs(): Promise<number | null> {
 
     if (error || !data) return null;
     return new Date(data.started_at).getTime();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * id of the currently active session (ended_at IS NULL), or null when none /
+ * on errors. Used by the away-grace expiry (lib/sessionGrace.ts) to verify it
+ * is still closing the same session the grace was armed for — a manual
+ * dashboard stop/start or a stale-check close during the window must stand.
+ */
+export async function getActiveSessionId(): Promise<string | null> {
+  if (!isSupabaseConfigured()) return null;
+
+  try {
+    const supabase = getSupabaseServerClient();
+    const { data, error } = await supabase
+      .from('sitting_sessions')
+      .select('id')
+      .is('ended_at', null)
+      .order('started_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error || !data) return null;
+    return data.id;
   } catch {
     return null;
   }

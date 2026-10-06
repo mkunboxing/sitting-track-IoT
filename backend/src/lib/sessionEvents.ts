@@ -1,5 +1,6 @@
-import { closeActiveSession, getActiveSessionStartedAtMs, openSession } from './sessionService';
+import { getActiveSessionStartedAtMs, openSession, resumePostureAfterAway } from './sessionService';
 import { getDeviceOwnerUserId } from './devices';
+import { AWAY_GRACE_PERIOD, cancelPendingAway, scheduleAwayClose } from './sessionGrace';
 import type { PostureState } from '../types/sitting';
 
 /**
@@ -32,6 +33,12 @@ import type { PostureState } from '../types/sitting';
  *      session is dropped instead of closing the newer session.
  * The device's own event timestamp (not backend receipt time) is used for
  * started_at/ended_at so replayed events land at their true moments.
+ *
+ * SESSION_ENDED never closes directly: like the telemetry pipeline's vacant
+ * edge, it arms the away grace period (lib/sessionGrace.ts) so a brief
+ * absence doesn't split the session — a SESSION_STARTED (this path or a
+ * telemetry snapshot) inside the window cancels the pending close and
+ * continues the same session.
  */
 
 export type SessionEventType = 'SESSION_STARTED' | 'SESSION_ENDED';
@@ -177,9 +184,38 @@ export async function handleSessionEventMessage(
 
   try {
     if (event.type === 'SESSION_STARTED') {
+      // A confirmed sit-down inside the away grace window: cancel the pending
+      // close and continue the SAME session. The reliable QoS 1 signal covers
+      // a dropped QoS 0 sitting snapshot, so this runs even when the
+      // telemetry pipeline never saw the return.
+      const awayAtMs = cancelPendingAway(deviceId);
       // Stamp the device's linked account onto the replayed/confirmed open —
       // same ownership rule as the telemetry pipeline (null while unlinked)
       const ownerUserId = await getDeviceOwnerUserId(deviceId);
+
+      if (awayAtMs !== null) {
+        const result = await resumePostureAfterAway(
+          event.state as PostureState,
+          eventTime,
+          awayAtMs,
+          { deviceId, userId: ownerUserId }
+        );
+        switch (result.status) {
+          case 'updated':
+            console.log(
+              `${log}: ${deviceId} ${event.eventId} — return within away grace, session ${result.session.id} continues (${event.state})`
+            );
+            break;
+          case 'unchanged':
+            console.log(`${log}: ${deviceId} ${event.eventId} — return within away grace, session unchanged`);
+            break;
+          case 'db_error':
+            console.error(`${log}: ${deviceId} failed to resume session after away:`, result.error);
+            break;
+        }
+        return;
+      }
+
       const result = await openSession(
         event.state as PostureState,
         eventTime,
@@ -205,19 +241,22 @@ export async function handleSessionEventMessage(
     // SESSION_ENDED — stale guard: a long outage can queue an END event that
     // predates a session opened later (device went vacant, then sat again
     // before the backend came back). Closing "whatever is active" would then
-    // kill the NEW session, so only close sessions that existed when the
-    // event happened.
+    // kill the NEW session, so the event is dropped before it can arm the
+    // away grace for a session that did not exist when it happened.
     const startedAtMs = await getActiveSessionStartedAtMs();
     if (startedAtMs !== null && startedAtMs > eventTime.getTime() + CLOCK_SKEW_TOLERANCE_MS) {
       console.log(`${log}: ${deviceId} ${event.eventId} — stale SESSION_ENDED predates the active session, ignored`);
       return;
     }
 
-    const result = await closeActiveSession(eventTime);
+    const result = await scheduleAwayClose(deviceId, eventTime.getTime());
     switch (result.status) {
-      case 'stopped':
+      case 'scheduled':
+        // Away grace armed — the device confirmed the vacancy, but a brief
+        // absence must not split the session. The close fires at the original
+        // away moment only if no sitting detection cancels it in time.
         console.log(
-          `${log}: ${deviceId} ${event.eventId} — session ${result.session.id} closed at device time ${eventTime.toISOString()}, duration ${result.durationSeconds}s`
+          `${log}: ${deviceId} ${event.eventId} — pending-away close armed (${AWAY_GRACE_PERIOD / 1000}s grace, anchored ${new Date(result.awayAtMs).toISOString()})`
         );
         break;
       case 'no_active_session':
@@ -225,7 +264,7 @@ export async function handleSessionEventMessage(
         console.log(`${log}: ${deviceId} ${event.eventId} — no active session, nothing to close`);
         break;
       case 'db_error':
-        console.error(`${log}: ${deviceId} failed to close session:`, result.error);
+        console.error(`${log}: ${deviceId} failed to arm the away-grace close:`, result.error);
         break;
     }
   } catch (err: unknown) {
