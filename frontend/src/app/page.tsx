@@ -334,7 +334,7 @@ export default function DashboardPage() {
       return;
     }
 
-    backgroundTimer.start('poll', 2500, () => {
+    backgroundTimer.start('poll', 12000, () => {
       fetchStatus(true);
     });
 

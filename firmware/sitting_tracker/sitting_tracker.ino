@@ -5,18 +5,11 @@
  *
  * Hardware Connections:
  *   - NodeMCU ESP8266
- *   - HC-SR04 Ultrasonic Distance Sensor
- *   - TRIG → NodeMCU Pin D6 (GPIO 12)
- *   - ECHO → NodeMCU Pin D5 (GPIO 14) via Voltage Divider (5V -> 3.3V)
- *   - VCC  → NodeMCU VIN (5V supply)
- *   - GND  → NodeMCU GND
- *
- * Voltage Divider on ECHO Pin:
- *   HC-SR04 ECHO (5V) ---> [ 1kΩ Resistor ] ---> NodeMCU D5 (3.3V)
- *                                           |
- *                                    [ 2kΩ Resistor ]
- *                                           |
- *                                          GND
+ *   - VL53LDK module tested with Adafruit_VL53L0X library
+ *   - VIN/VCC → 3.3V (only if supported by your breakout board)
+ *   - GND     → NodeMCU GND
+ *   - SDA     → NodeMCU D2 (GPIO 4)
+ *   - SCL     → NodeMCU D1 (GPIO 5)
  *
  * Logic & Timing Specifications (posture tracking — thresholds + debounce live
  * in debounce.h, shared with the host-side test suite):
@@ -29,7 +22,7 @@
  *                          vacant (the session CLOSES on that snapshot)
  *   - POSTURE_CONFIRM    = 2000 ms continuous to confirm relaxing ↔ attentive
  *                          (posture switch only — never opens/closes a session)
- *   - SENSOR_INTERVAL    = 700 ms  (ultrasonic ping interval)
+ *   - SENSOR_INTERVAL    = 700 ms  (I2C laser ranging interval)
  *
  * Communication (MQTT over TLS via EMQX Cloud — the only telemetry transport):
  *   - Every TELEMETRY_INTERVAL_MS the device publishes its CURRENT seating
@@ -86,8 +79,8 @@
  *     Non-blocking between checks; failures are logged and retried next
  *     interval without touching MQTT/telemetry/session behavior (section 10).
  *
- * Required Arduino libraries: PubSubClient (Nick O'Leary — Library Manager);
- * everything else is the ESP8266 core (built-in WiFiClientSecure/BearSSL).
+ * Required Arduino libraries: PubSubClient, Adafruit VL53L0X (plus its
+ * Adafruit BusIO dependency); everything else is the ESP8266 core.
  * ==============================================================================
  */
 
@@ -96,6 +89,8 @@
 #include <BearSSLHelpers.h>
 #include <PubSubClient.h>
 #include <time.h>
+#include <Wire.h>
+#include <Adafruit_VL53L0X.h>
 
 // Pure seating-state machine (thresholds, confirmation windows, debounce) —
 // shared verbatim with firmware/tests/debounce_test.cpp
@@ -239,11 +234,14 @@ const char* RENDER_HEALTH_CA_CERT =
 // 2. HARDWARE PIN DEFINITIONS & THRESHOLDS
 // ==============================================================================
 
-// NodeMCU Pin Mapping
-// D6 = GPIO 12 (TRIG)
-// D5 = GPIO 14 (ECHO)
-const int PIN_TRIG = 12; // D6
-const int PIN_ECHO = 14; // D5
+// NodeMCU ESP8266 I2C pin mapping for the VL53LDK breakout
+// D2 = GPIO 4 (SDA); D1 = GPIO 5 (SCL)
+const uint8_t SDA_PIN = D2;
+const uint8_t SCL_PIN = D1;
+
+// VL53LDK driver used by the previously tested sensor sketch
+Adafruit_VL53L0X laser;
+bool sensorOK = false;
 
 // Posture Detection Thresholds & Confirmation Windows — defined in debounce.h
 //   distance <  8      → RELAXING
@@ -344,9 +342,15 @@ void setup() {
   Serial.println(F("  Transport: MQTT over TLS (EMQX Cloud)"));
   Serial.println(F("========================================"));
 
-  pinMode(PIN_TRIG, OUTPUT);
-  pinMode(PIN_ECHO, INPUT);
-  digitalWrite(PIN_TRIG, LOW);
+  // Initialize I2C and the laser-ranging sensor before the first reading.
+  Wire.begin(SDA_PIN, SCL_PIN);
+  sensorOK = laser.begin();
+  if (sensorOK) {
+    Serial.println(F("[SENSOR] VL53LDK initialized using Adafruit_VL53L0X"));
+  } else {
+    Serial.println(F("[SENSOR] ERROR: laser sensor not detected. Check VIN, GND, SDA=D2, SCL=D1 and library compatibility."));
+    Serial.println(F("[SENSOR] The firmware will keep running and retry sensor initialization."));
+  }
 
   connectToWiFi();
 
@@ -369,7 +373,7 @@ void setup() {
   // --- Render keep-alive heartbeat (GET /health every 10 min, section 10) ---
   setupHealthHeartbeat();
 
-  // Initial read to calibrate
+  // Initial read to seed the debounce candidate state.
   float initialDistance = readDistanceCm();
   Serial.print(F("[INIT] Initial Distance: "));
   Serial.print(initialDistance);
@@ -409,7 +413,10 @@ void loop() {
     lastSensorReadTime = now;
 
     float distance = readDistanceCm();
-    lastMeasuredDistanceCm = distance; // remembered for the periodic telemetry publish
+    if (!sensorOK) {
+      Serial.println(F("[SENSOR] No valid sensor connection; skipping state update."));
+    } else {
+      lastMeasuredDistanceCm = distance; // remembered for the periodic telemetry publish
 
     // Print reading to Serial Monitor
     Serial.print(F("[SENSOR] Dist: "));
@@ -457,6 +464,7 @@ void loop() {
     }
 
     Serial.println();
+    } // sensorOK: end of valid sensor processing
   }
 
   // 3. Maintain the MQTT connection: service keepalive pings/incoming packets
@@ -485,31 +493,27 @@ void loop() {
 }
 
 // ==============================================================================
-// 7. SENSOR READING (HC-SR04 Ultrasonic)
+// 7. SENSOR READING (VL53LDK I2C laser-ranging module)
 // ==============================================================================
 
 float readDistanceCm() {
-  // Clear trigger pin
-  digitalWrite(PIN_TRIG, LOW);
-  delayMicroseconds(2);
+  if (!sensorOK) {
+    // Retry initialization without blocking the rest of the firmware.
+    sensorOK = laser.begin();
+    if (!sensorOK) return -1.0;
+    Serial.println(F("[SENSOR] Laser sensor initialized after retry"));
+  }
 
-  // Send 10µs HIGH pulse
-  digitalWrite(PIN_TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(PIN_TRIG, LOW);
+  VL53L0X_RangingMeasurementData_t measurement;
+  laser.rangingTest(&measurement, false);
 
-  // Measure ECHO pulse length (timeout = 30000 µs ~ 5 meters max)
-  unsigned long duration = pulseIn(PIN_ECHO, HIGH, 30000);
-
-  if (duration == 0) {
-    // Sensor timed out / out of range
+  // RangeStatus == 4 means out of range in the tested Adafruit driver.
+  if (measurement.RangeStatus == 4 || measurement.RangeMilliMeter == 0) {
     return -1.0;
   }
 
-  // Speed of sound: 343 m/s = 0.0343 cm/µs
-  // Distance = (duration / 2) * 0.0343
-  float distanceCm = (duration * 0.0343) / 2.0;
-  return distanceCm;
+  // The driver reports millimetres; the sitting-state machine uses cm.
+  return measurement.RangeMilliMeter / 10.0f;
 }
 
 // ==============================================================================
